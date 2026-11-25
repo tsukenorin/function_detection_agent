@@ -7,4 +7,6 @@ __pycache__/
 !.env.example
 .idea/
 .cache/
+experiments/results/ckpt_*.jsonl
+
 
