@@ -42,4 +42,20 @@ __all__ = [
     "SampleLoaderProtocol",
     "VulnerabilityDetector",
     "TaskServiceProtocol",
+    "VulnerabilityDetectionAgent",
+    "write_result_jsonl",
+    "write_reports_jsonl",
+    "format_report_markdown",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"VulnerabilityDetectionAgent", "AgentState", "parse_verdict_from_text"}:
+        from . import agent_loop
+
+        return getattr(agent_loop, name)
+    if name in {"write_result_jsonl", "write_reports_jsonl", "format_report_markdown"}:
+        from . import report
+
+        return getattr(report, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
