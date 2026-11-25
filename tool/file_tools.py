@@ -20,18 +20,27 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from langchain.tools import tool
 
+from .trace import BudgetExceededError, ToolBudget, ToolTraceRecorder
 from .workspace import (
+    DEFAULT_GREP_MAX_RESULTS,
     DEFAULT_LINE_LIMIT,
+    DEFAULT_SYMBOL_MAX_RESULTS,
     MAX_LINE_LIMIT,
     Workspace,
     WorkspaceError,
 )
 
-__all__ = ["build_file_tools", "FILE_TOOL_NAMES"]
+__all__ = [
+    "build_file_tools",
+    "build_repo_tools",
+    "FILE_TOOL_NAMES",
+    "REPO_TOOL_NAMES",
+]
 
 FILE_TOOL_NAMES = (
     "list_dir",
@@ -39,6 +48,15 @@ FILE_TOOL_NAMES = (
     "find_files",
     "stat",
     "write_file",
+)
+
+REPO_TOOL_NAMES = (
+    "list_dir",
+    "read_file",
+    "find_files",
+    "stat",
+    "grep",
+    "find_symbol",
 )
 
 
@@ -135,3 +153,207 @@ def build_file_tools(workspace: Workspace) -> list:
             return _err(exc)
 
     return [list_dir, read_file, find_files, stat, write_file]
+
+
+def build_repo_tools(
+    workspace: Workspace,
+    *,
+    recorder: ToolTraceRecorder | None = None,
+    budget: ToolBudget | None = None,
+) -> list:
+    """构建面向漏洞检测 Agent 的只读、可审计、带预算控制的仓库上下文工具集。
+
+    特点：
+    - 仅暴露只读检索/阅读工具（不暴露 ``write_file``），防止篡改证据；
+    - 每次调用自动经过 ``budget`` 校验与 ``recorder`` 审计；
+    - 闭包绑定单个 ``Workspace``，确保严格的成对版本隔离。
+    """
+
+    def _run_audited(
+        tool_name: str,
+        args: dict[str, Any],
+        path: str | None,
+        fn,
+    ) -> str:
+        t0 = time.perf_counter()
+        if recorder is not None:
+            recorder.record_call_start(tool_name, args)
+
+        try:
+            if budget is not None:
+                budget.consume_call()
+            payload = fn()
+            raw_out = _ok(payload)
+            out = budget.trim_and_account(raw_out) if budget is not None else raw_out
+            ok = not out.startswith("ERROR:")
+            summary = _summarize_payload(tool_name, payload)
+        except (WorkspaceError, BudgetExceededError) as exc:
+            out = _err(exc)
+            ok = False
+            summary = str(exc)
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if recorder is not None:
+            recorder.record_call_end(
+                tool_name=tool_name,
+                args=args,
+                path=path,
+                ok=ok,
+                summary=summary,
+                chars_returned=len(out),
+                latency_ms=elapsed_ms,
+            )
+        return out
+
+    @tool
+    def list_dir(path: str = ".", recursive: bool = False, max_depth: int = 2) -> str:
+        """列出代码仓库快照中指定目录的结构，帮助快速定位源码目录。
+
+        Args:
+            path: 相对工作区根目录的路径，根目录使用 "."。
+            recursive: 是否递归列出子目录。
+            max_depth: 递归深度上限（仅 recursive=True 时生效）。
+        """
+        args = {"path": path, "recursive": recursive, "max_depth": max_depth}
+        return _run_audited(
+            "list_dir",
+            args,
+            path,
+            lambda: workspace.list_dir(path, recursive=recursive, max_depth=max_depth),
+        )
+
+    @tool
+    def read_file(path: str, offset: int = 1, limit: int = DEFAULT_LINE_LIMIT) -> str:
+        """按行读取代码仓库中的源文件，返回带行号的文本内容。
+
+        用于核实被调用函数实现、结构体定义、宏定义或调用方边界检查逻辑。
+
+        Args:
+            path: 相对工作区根目录的文件路径。
+            offset: 1-based 起始行号。
+            limit: 最多返回行数（建议 80-200 行，避免浪费上下文预算）。
+        """
+        clamped = min(limit, MAX_LINE_LIMIT)
+        args = {"path": path, "offset": offset, "limit": clamped}
+        return _run_audited(
+            "read_file",
+            args,
+            path,
+            lambda: workspace.read_file(path, offset=offset, limit=clamped),
+        )
+
+    @tool
+    def find_files(pattern: str, max_results: int = 100) -> str:
+        """按文件名或相对路径通配查找仓库中的源码/头文件。
+
+        Args:
+            pattern: 通配模式，如 `*.c`、`*exif*`、`src/*.h`。
+            max_results: 最多返回多少条路径。
+        """
+        args = {"pattern": pattern, "max_results": max_results}
+        return _run_audited(
+            "find_files",
+            args,
+            None,
+            lambda: workspace.find_files(pattern, max_results=max_results),
+        )
+
+    @tool
+    def stat(path: str) -> str:
+        """查看仓库中单个路径是否存在及其类型与大小。"""
+        args = {"path": path}
+        return _run_audited("stat", args, path, lambda: workspace.stat(path))
+
+    @tool
+    def grep(
+        pattern: str,
+        path: str = ".",
+        is_regex: bool = False,
+        case_sensitive: bool = True,
+        file_glob: str | None = None,
+        context_lines: int = 2,
+        max_results: int = DEFAULT_GREP_MAX_RESULTS,
+    ) -> str:
+        """在代码仓库中按关键字或正则搜索内容，返回命中文件路径、行号与上下文。
+
+        适合查找全局变量用法、宏定义、错误检查语句或特定函数调用点。
+
+        Args:
+            pattern: 搜索文本或正则表达式。
+            path: 搜索起始目录或文件路径（默认 "."）。
+            is_regex: 是否按正则表达式解析 pattern。
+            case_sensitive: 是否区分大小写。
+            file_glob: 可选文件过滤通配，如 `*.c`、`*.h`。
+            context_lines: 命中行前后附带的上下文行数。
+            max_results: 最多返回条数。
+        """
+        args = {
+            "pattern": pattern,
+            "path": path,
+            "is_regex": is_regex,
+            "case_sensitive": case_sensitive,
+            "file_glob": file_glob,
+            "context_lines": context_lines,
+            "max_results": max_results,
+        }
+        return _run_audited(
+            "grep",
+            args,
+            path,
+            lambda: workspace.grep(
+                pattern,
+                path,
+                is_regex=is_regex,
+                case_sensitive=case_sensitive,
+                file_glob=file_glob,
+                context_lines=context_lines,
+                max_results=max_results,
+            ),
+        )
+
+    @tool
+    def find_symbol(
+        symbol_name: str,
+        path: str = ".",
+        max_results: int = DEFAULT_SYMBOL_MAX_RESULTS,
+    ) -> str:
+        """在 C/C++ 代码仓库中定位函数、结构体、类型或宏的定义与调用位置（定义优先）。
+
+        当待测函数调用了外部辅助函数、宏或结构体成员，且需要确认其是否包含边界/空指针检查时优先调用本工具。
+
+        Args:
+            symbol_name: C/C++ 标识符，如 `ReadBlobByte`、`OP_REQUIRES`、`TensorShape`。
+            path: 限定搜索目录或文件（默认 "."）。
+            max_results: 最多返回结果数。
+        """
+        args = {"symbol_name": symbol_name, "path": path, "max_results": max_results}
+        return _run_audited(
+            "find_symbol",
+            args,
+            path,
+            lambda: workspace.find_symbol(symbol_name, path=path, max_results=max_results),
+        )
+
+    return [list_dir, read_file, find_files, stat, grep, find_symbol]
+
+
+def _summarize_payload(tool_name: str, payload: dict[str, Any]) -> str:
+    if tool_name == "read_file":
+        return (
+            f"read {payload.get('path')} "
+            f"L{payload.get('start_line')}-{payload.get('end_line')}"
+        )
+    if tool_name == "grep":
+        return f"grep '{payload.get('pattern')}' -> {payload.get('count', 0)} hits"
+    if tool_name == "find_symbol":
+        return (
+            f"symbol '{payload.get('symbol')}' -> "
+            f"{payload.get('definition_count', 0)} defs / {payload.get('count', 0)} total"
+        )
+    if tool_name == "find_files":
+        return f"find '{payload.get('pattern')}' -> {payload.get('count', 0)} files"
+    if tool_name == "list_dir":
+        return f"list '{payload.get('path')}' -> {payload.get('count', 0)} entries"
+    if tool_name == "stat":
+        return f"stat '{payload.get('path')}' ({payload.get('type')})"
+    return tool_name

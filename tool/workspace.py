@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,13 @@ MAX_LINE_LIMIT = 2000
 DEFAULT_MAX_READ_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_ENTRIES = 500
 DEFAULT_MAX_RESULTS = 200
+DEFAULT_GREP_MAX_RESULTS = 50
+DEFAULT_SYMBOL_MAX_RESULTS = 30
+
+#: C/C++ 常见源码与头文件后缀，用于 find_symbol 优先检索。
+_C_CPP_EXTENSIONS = frozenset(
+    {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".inc"}
+)
 
 #: 遍历目录时跳过的目录名（快照里不该有 .git，但缓存目录可能有）。
 _SKIP_DIRS = frozenset({".git", "__pycache__", ".venv", "node_modules"})
@@ -106,10 +114,17 @@ class Workspace:
         self.max_read_bytes = max(1, int(max_read_bytes))
 
     # ------------------------------------------------------------------
+    # 惰性物化钩子（供 RepoFS 子类覆写）
+    # ------------------------------------------------------------------
+    def _ensure_local(self) -> None:
+        """确保存储目录已在本地物化。普通本地 Workspace 为空操作。"""
+
+    # ------------------------------------------------------------------
     # 路径处理
     # ------------------------------------------------------------------
     def _resolve(self, path: str) -> Path:
         """把"工作区内的相对路径"解析成绝对路径，越界即抛错。"""
+        self._ensure_local()
         raw = str(path).strip().replace("\\", "/")
         if not raw:
             raise PathViolation("路径不能为空；表示根目录请用 '.'")
@@ -297,6 +312,7 @@ class Workspace:
         - `src/*.c`   匹配相对路径
         """
         pat = (pattern or "*").strip().replace("\\", "/") or "*"
+        self._ensure_local()
         match_rel = "/" in pat
         found: list[str] = []
 
@@ -318,6 +334,205 @@ class Workspace:
             "files": sorted(found),
             "count": len(found),
             "truncated": len(found) >= max_results,
+        }
+
+    def _iter_text_files(
+        self,
+        base: Path,
+        *,
+        file_glob: str | None = None,
+        extensions: frozenset[str] | None = None,
+    ):
+        """安全迭代工作区内的文本文件，跳过隐藏项、噪音目录与二进制文件。"""
+        if base.is_file():
+            candidates = [base]
+        else:
+            candidates = sorted(base.rglob("*"))
+
+        norm_glob = file_glob.strip().replace("\\", "/") if file_glob else None
+        match_rel = bool(norm_glob and "/" in norm_glob)
+
+        for child in candidates:
+            if child.is_dir():
+                continue
+            rel = self.relative(child)
+            rel_parts = rel.split("/")
+            if any(part in _SKIP_DIRS or part.startswith(".") for part in rel_parts):
+                continue
+            if not self._is_safe(child) or not child.is_file():
+                continue
+            if extensions is not None and child.suffix.lower() not in extensions:
+                continue
+            if norm_glob is not None:
+                target_name = rel if match_rel else child.name
+                if not fnmatch.fnmatch(target_name, norm_glob):
+                    continue
+            try:
+                size = child.stat().st_size
+                if size > self.max_read_bytes:
+                    continue
+                with child.open("rb") as fh:
+                    if b"\x00" in fh.read(_SNIFF_BYTES):
+                        continue
+            except OSError:
+                continue
+            yield child, rel
+
+    def grep(
+        self,
+        pattern: str,
+        path: str = ".",
+        *,
+        is_regex: bool = False,
+        case_sensitive: bool = True,
+        file_glob: str | None = None,
+        context_lines: int = 2,
+        max_results: int = DEFAULT_GREP_MAX_RESULTS,
+    ) -> dict[str, Any]:
+        """在工作区内按内容搜索文本或正则（复用 ``_resolve`` 沙箱校验）。"""
+        if not pattern:
+            raise WorkspaceError("grep 的 pattern 不能为空")
+
+        base = self._resolve(path)
+        if not base.exists():
+            raise NotFound(f"路径不存在：{self.relative(base)}")
+
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            compiled = re.compile(pattern if is_regex else re.escape(pattern), flags)
+        except re.error as exc:
+            raise WorkspaceError(f"无效的正则表达式：{exc}") from exc
+
+        ctx = max(0, min(int(context_lines), 10))
+        limit = max(1, min(int(max_results), 200))
+        matches: list[dict[str, Any]] = []
+        truncated = False
+
+        for child, rel in self._iter_text_files(base, file_glob=file_glob):
+            try:
+                lines = child.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for idx, line in enumerate(lines):
+                if not compiled.search(line):
+                    continue
+                if len(matches) >= limit:
+                    truncated = True
+                    break
+                start = max(0, idx - ctx)
+                end = min(len(lines), idx + ctx + 1)
+                context = [f"{i + 1}: {lines[i]}" for i in range(start, end)]
+                matches.append(
+                    {
+                        "path": rel,
+                        "line": idx + 1,
+                        "text": line,
+                        "context": "\n".join(context),
+                    }
+                )
+            if truncated:
+                break
+
+        return {
+            "pattern": pattern,
+            "path": self.relative(base),
+            "matches": matches,
+            "count": len(matches),
+            "truncated": truncated,
+        }
+
+    def find_symbol(
+        self,
+        symbol_name: str,
+        *,
+        path: str = ".",
+        max_results: int = DEFAULT_SYMBOL_MAX_RESULTS,
+    ) -> dict[str, Any]:
+        """在 C/C++ 代码中定位符号的定义、声明与调用点（优先返回定义）。
+
+        用于按需挖掘被调用方实现、调用方、结构体/类型定义与宏定义。
+        """
+        sym = symbol_name.strip()
+        if not sym or not re.match(r"^[A-Za-z_][A-Za-z0-9_:~]*$", sym):
+            raise WorkspaceError(f"非法的 C/C++ 符号名：{symbol_name!r}")
+
+        base = self._resolve(path)
+        if not base.exists():
+            raise NotFound(f"路径不存在：{self.relative(base)}")
+
+        limit = max(1, min(int(max_results), 100))
+        esc = re.escape(sym)
+        word_re = re.compile(rf"\b{esc}\b")
+        macro_re = re.compile(rf"^\s*#\s*define\s+{esc}\b")
+        type_re = re.compile(
+            rf"^\s*(?:typedef\s+)?(?:struct|union|enum|class)\s+{esc}\b|^\s*typedef\b.*\b{esc}\s*;"
+        )
+        func_sig_re = re.compile(rf"\b{esc}\s*\(")
+
+        definitions: list[dict[str, Any]] = []
+        references: list[dict[str, Any]] = []
+
+        # 优先在 C/C++ 源/头文件中查找；若目录下没有此类文件则回退到所有文本文件
+        files = list(self._iter_text_files(base, extensions=_C_CPP_EXTENSIONS))
+        if not files:
+            files = list(self._iter_text_files(base))
+
+        for child, rel in files:
+            try:
+                lines = child.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+
+            for idx, line in enumerate(lines):
+                if not word_re.search(line):
+                    continue
+                stripped = line.strip()
+                if stripped.startswith("//") or stripped.startswith("/*") or stripped.startswith("*"):
+                    continue
+
+                kind = "reference"
+                if macro_re.search(line):
+                    kind = "macro_def"
+                elif type_re.search(line):
+                    kind = "type_def"
+                elif func_sig_re.search(line):
+                    # 判断函数定义（当前行或后续 3 行内出现 '{' 且当前行不是 if/while/for/switch 调用）
+                    prefix = line[: line.find(sym)].strip()
+                    if (
+                        prefix
+                        and not prefix.endswith((".", "->", "=", "(", ",", "return"))
+                        and not re.match(r"^(?:if|while|for|switch|return|else)\b", stripped)
+                    ):
+                        lookahead = " ".join(lines[idx : min(len(lines), idx + 4)])
+                        if "{" in lookahead and not stripped.endswith(";"):
+                            kind = "func_def"
+                        elif stripped.endswith(";"):
+                            kind = "declaration"
+
+                start = max(0, idx - 1)
+                end = min(len(lines), idx + (6 if kind in {"func_def", "type_def", "macro_def"} else 2))
+                entry = {
+                    "path": rel,
+                    "line": idx + 1,
+                    "kind": kind,
+                    "text": stripped,
+                    "snippet": "\n".join(f"{i + 1}: {lines[i]}" for i in range(start, end)),
+                }
+                if kind in {"func_def", "macro_def", "type_def", "declaration"}:
+                    definitions.append(entry)
+                elif len(references) < limit:
+                    references.append(entry)
+
+        combined = definitions + references
+        truncated = len(combined) > limit
+        results = combined[:limit]
+        return {
+            "symbol": sym,
+            "path": self.relative(base),
+            "results": results,
+            "definition_count": len(definitions),
+            "count": len(results),
+            "truncated": truncated,
         }
 
     # ------------------------------------------------------------------
