@@ -25,6 +25,7 @@ from typing import Any
 
 from langchain.tools import tool
 
+from .callgraph import CallGraphAnalyzer, MAX_CALLCHAIN_DEPTH
 from .trace import BudgetExceededError, ToolBudget, ToolTraceRecorder
 from .workspace import (
     DEFAULT_GREP_MAX_RESULTS,
@@ -57,6 +58,8 @@ REPO_TOOL_NAMES = (
     "stat",
     "grep",
     "find_symbol",
+    "inspect_call_chain",
+    "read_symbol_body",
 )
 
 
@@ -164,10 +167,11 @@ def build_repo_tools(
     """构建面向漏洞检测 Agent 的只读、可审计、带预算控制的仓库上下文工具集。
 
     特点：
-    - 仅暴露只读检索/阅读工具（不暴露 ``write_file``），防止篡改证据；
+    - 仅暴露只读检索/阅读与 Tree-sitter 确定性调用链工具（不暴露 ``write_file``）；
     - 每次调用自动经过 ``budget`` 校验与 ``recorder`` 审计；
-    - 闭包绑定单个 ``Workspace``，确保严格的成对版本隔离。
+    - 闭包绑定单个 ``Workspace`` 与 ``CallGraphAnalyzer``，确保严格的成对版本隔离。
     """
+    callgraph = CallGraphAnalyzer(workspace)
 
     def _run_audited(
         tool_name: str,
@@ -334,10 +338,95 @@ def build_repo_tools(
             lambda: workspace.find_symbol(symbol_name, path=path, max_results=max_results),
         )
 
-    return [list_dir, read_file, find_files, stat, grep, find_symbol]
+    @tool
+    def inspect_call_chain(
+        symbol_name: str,
+        direction: str = "both",
+        depth: int = 1,
+        path: str = ".",
+        max_nodes: int = 15,
+    ) -> str:
+        """使用 Tree-sitter AST 确定性解析指定函数的调用链地图（调用方与被调用方，默认 1 跳）。
+
+        推荐采用渐进式展开策略：先用 depth=1 查看 1 跳直接调用方/被调用方，若不足以判定再针对
+        返回结果中的 frontier_callees / frontier_callers 展开下一跳（最多 3 跳）。
+
+        Args:
+            symbol_name: C/C++ 函数名（支持 Class::Method）。
+            direction: 展开方向："both"（双向）、"callees"（向下查被调用方）、"callers"（向上查调用方）。
+            depth: 展开跳数（1~3，建议先用 1）。
+            path: 限定搜索目录（默认 "."）。
+            max_nodes: 最多返回边数（默认 15）。
+        """
+        norm_dir = direction if direction in {"both", "callees", "callers"} else "both"
+        clamped_depth = max(1, min(int(depth), MAX_CALLCHAIN_DEPTH))
+        args = {
+            "symbol_name": symbol_name,
+            "direction": norm_dir,
+            "depth": clamped_depth,
+            "path": path,
+            "max_nodes": max_nodes,
+        }
+        return _run_audited(
+            "inspect_call_chain",
+            args,
+            path,
+            lambda: callgraph.inspect_call_chain(
+                symbol_name,
+                path=path,
+                direction=norm_dir,  # type: ignore[arg-type]
+                depth=clamped_depth,
+                max_nodes=max_nodes,
+            ),
+        )
+
+    @tool
+    def read_symbol_body(
+        symbol_name: str,
+        path: str = ".",
+        max_lines: int = 120,
+    ) -> str:
+        """基于 Tree-sitter AST 精确读取函数、结构体、类型别名或宏的完整定义代码（带行号）。
+
+        比手动 grep + read_file 更准确高效，优先用于查看调用链中关键被调用函数或结构体的完整实现。
+
+        Args:
+            symbol_name: C/C++ 符号名（函数名、结构体名、宏名）。
+            path: 限定搜索目录（默认 "."）。
+            max_lines: 最多返回行数（默认 120）。
+        """
+        args = {"symbol_name": symbol_name, "path": path, "max_lines": max_lines}
+        return _run_audited(
+            "read_symbol_body",
+            args,
+            path,
+            lambda: callgraph.read_symbol_body(symbol_name, path=path, max_lines=max_lines),
+        )
+
+    return [
+        list_dir,
+        read_file,
+        find_files,
+        stat,
+        grep,
+        find_symbol,
+        inspect_call_chain,
+        read_symbol_body,
+    ]
 
 
 def _summarize_payload(tool_name: str, payload: dict[str, Any]) -> str:
+    if tool_name == "inspect_call_chain":
+        return (
+            f"callchain '{payload.get('symbol')}' (depth={payload.get('depth')}) -> "
+            f"{len(payload.get('callers', []))} callers, {len(payload.get('callees', []))} callees"
+        )
+    if tool_name == "read_symbol_body":
+        defs = payload.get("definitions", [])
+        if defs:
+            d0 = defs[0]
+            return f"body '{d0.get('symbol')}' ({d0.get('kind')}) {d0.get('path')}:L{d0.get('start_line')}-{d0.get('end_line')}"
+        return f"body '{payload.get('symbol')}' -> not found"
     if tool_name == "read_file":
         return (
             f"read {payload.get('path')} "
