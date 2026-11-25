@@ -7,12 +7,15 @@ from agent.schema import AgentInput, KnowledgeRetrieveRecord
 __all__ = [
     "BASELINE_SYSTEM_PROMPT",
     "IMPROVED_SYSTEM_PROMPT",
+    "STAGE1_GATE_SYSTEM_PROMPT",
     "SELF_CHECK_PROMPT",
     "JSON_REPAIR_PROMPT",
     "format_numbered_func",
     "format_knowledge_context",
     "build_baseline_user_prompt",
     "build_improved_user_prompt",
+    "build_stage1_user_prompt",
+    "build_stage2_investigation_prompt",
 ]
 
 BASELINE_SYSTEM_PROMPT = """你是一位 C/C++ 代码安全审计助手。
@@ -114,6 +117,76 @@ def format_knowledge_context(record: KnowledgeRetrieveRecord | None) -> str:
             parts.append(f"- 历史修复差异（- 为漏洞前，+ 为修复后）：\n```diff\n{hit.fix_pattern}\n```")
         blocks.append("\n".join(parts))
     return "\n\n".join(blocks)
+
+
+STAGE1_GATE_SYSTEM_PROMPT = """你是一位资深的 C/C++ 软件安全漏洞审计智能体，当前处于【第 1 阶段：无工具独立初判与门控评估】。
+你的任务是仅根据“待测函数源码 + 历史相似 CVE 模式卡”先做一次严谨初判，并诚实评估是否真正需要进入第 2 阶段去代码仓库查证外部符号。
+
+【核心审计原则】
+1. **区分“真正缺失防御（prediction=1）”与“已有有效防御（prediction=0）”**：
+   - 待测函数可能是漏洞版，也可能是已打过安全补丁的修复版。
+   - 若危险操作前已有明确守卫（如 `!ptr` 判空、`if (idx < 0 || idx > MAX)` 上下界校验、显式 `(ssize_t)` 类型转换、主机名校验 `X509_VERIFY_PARAM_set1_host`、`OP_REQUIRES` 等），应判定 `prediction = 0`。
+   - 严禁把所有 C/C++ 代码一概判为有洞，也严禁因“同名旧 CVE 已修”就忽略当前函数里的其他明显漏洞（反锚定偏误）。
+2. **严格的门控申请条件（何时设置 `needs_repo_check = true`）**：
+   - **默认设为 `needs_repo_check = false`**：只要从函数自身代码就能明确看到“确凿缺失的局部守卫”或“清晰完整的局部防御检查”，请直接给 `confidence = "high"`、`needs_repo_check = false`、`target_symbols = []`！
+   - **严禁为了“确认修复版有没有其他旁支小毛病”去申请查仓库！**
+   - **仅当同时满足两条时**，才设 `confidence = "medium"`（或 `"low"`）+ `needs_repo_check = true`：
+     (a) 仅凭函数内部代码**真的无法判断** 0 还是 1（例如某个被调函数内部到底做没做校验、某个结构体数组大小/字段有符号性未知、某个 `llvm_unreachable`/分支是否真的会被调用方触发）；
+     (b) 你能点出 **1~2 个具体的外部符号名**（填入 `target_symbols`）和**单一核心问题**（填入 `open_question`），查清它就能直接翻转或敲定 0/1。
+
+严格只输出一个合法 JSON 对象：
+{
+  "prediction": 0 或 1,
+  "confidence": "high" | "medium" | "low",
+  "needs_repo_check": true 或 false,
+  "target_symbols": ["仅当 needs_repo_check=true 时填写 1~2 个具体外部符号名"],
+  "open_question": "仅当 needs_repo_check=true 时填写单一核心核验问题",
+  "cwe_candidates": ["CWE-xxx"],
+  "reason": "结合具体行号与历史 CVE 模式卡说明初判理由",
+  "evidence_cited": ["函数第 X 行 ..."],
+  "guard_assessment": "列出关键危险点及局部守卫情况"
+}"""
+
+
+def build_stage1_user_prompt(
+    agent_input: AgentInput,
+    *,
+    knowledge_record: KnowledgeRetrieveRecord | None = None,
+    max_func_chars: int = 18000,
+) -> str:
+    numbered = format_numbered_func(agent_input.func, max_chars=max_func_chars)
+    func_title = agent_input.function_name or "未知函数"
+    kb_section = format_knowledge_context(knowledge_record)
+    return (
+        f"## 待检测函数信息（第 1 阶段独立初判）\n"
+        f"- 样本编号：{agent_input.idx}\n"
+        f"- 所属项目：{agent_input.repo_name or '未知'}\n"
+        f"- 函数名：{func_title}\n\n"
+        f"## 历史相似 CVE 领域知识（RAG 模式卡）\n"
+        f"{kb_section}\n\n"
+        f"## 待测 C/C++ 函数源码（带 1-based 行号）\n"
+        f"```cpp\n{numbered}\n```\n\n"
+        f"请先在不读取仓库的前提下做出严谨初判，并按门控规则输出单一 JSON。"
+    )
+
+
+def build_stage2_investigation_prompt(
+    *,
+    target_symbols: list[str],
+    open_question: str,
+) -> str:
+    syms = ", ".join(f"`{s}`" for s in target_symbols[:3])
+    return (
+        f"## 第 2 阶段：代码门控已放行（定向仓库调用链查证）\n"
+        f"- 锁定核验目标符号：{syms}\n"
+        f"- 唯一待答核心问题：{open_question or '核实上述外部符号是否存在关键边界/空指针/调用约束'}\n\n"
+        f"【定向查证纪律】\n"
+        f"1. 优先使用 Tree-sitter 确定性工具 `read_symbol_body` 或 `inspect_call_chain(depth=1)` 精准查证上述目标符号；"
+        f"每次返回均会经纯客观压缩子代理提纯并保留关键原代码行。\n"
+        f"2. 仅当压缩证据标注 `completeness=needs_more_hops` 且仍未回答上述核心问题时，才沿 `next_frontier_symbols` 展开下一跳。\n"
+        f"3. **严禁旁支挑刺**：不得因为仓库里顺带看到其他无关函数或外围指针链的历史小瑕疵，就把一个核心路径已修复的函数改判为 1。\n"
+        f"4. 一旦核心问题得到确凿回答，立刻停止调用工具并输出更新后的 JSON 判定。"
+    )
 
 
 def build_baseline_user_prompt(

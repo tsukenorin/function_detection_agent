@@ -176,7 +176,7 @@ def test_improved_mode_autonomous_rag_repo_tools_and_self_check(sample_ws):
     report = agent.detect(
         agent_input,
         workspace=sample_ws,
-        config=AgentConfig.improved(),
+        config=AgentConfig.improved(two_stage_gate=False, enable_evidence_compactor=False),
         on_event=events.append,
     )
 
@@ -214,7 +214,13 @@ def test_budget_exhausted_forces_termination_and_json_repair(sample_ws, tmp_path
         ],
         received_messages=[],
     )
-    cfg = AgentConfig.improved(max_tool_calls=1, max_steps=4, enable_self_check=False)
+    cfg = AgentConfig.improved(
+        max_tool_calls=1,
+        max_steps=4,
+        enable_self_check=False,
+        two_stage_gate=False,
+        enable_evidence_compactor=False,
+    )
     agent = VulnerabilityDetectionAgent(model=model, retriever=StubRetriever())
     report = agent.detect(
         AgentInput(idx=103, func="void bar(char *p) { p[99] = 0; }", repo_name="org/demo"),
@@ -243,11 +249,12 @@ def test_evidence_gated_config_and_prompt_directive():
 
     cfg = AgentConfig.improved()
     assert cfg.evidence_gated_tools is True
+    assert cfg.two_stage_gate is True
     assert cfg.enable_evidence_compactor is True
     assert cfg.reasoning_effort == "low"
     assert cfg.max_steps == 8
-    assert cfg.max_tool_calls == 6
-    assert cfg.max_read_chars == 30000
+    assert cfg.max_tool_calls == 4
+    assert cfg.max_read_chars == 24000
 
     prompt = build_improved_user_prompt(
         AgentInput(idx=1, func="int f() { return 0; }", repo_name="org/demo"),

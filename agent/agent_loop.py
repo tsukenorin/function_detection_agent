@@ -56,8 +56,11 @@ from .prompts import (
     IMPROVED_SYSTEM_PROMPT,
     JSON_REPAIR_PROMPT,
     SELF_CHECK_PROMPT,
+    STAGE1_GATE_SYSTEM_PROMPT,
     build_baseline_user_prompt,
     build_improved_user_prompt,
+    build_stage1_user_prompt,
+    build_stage2_investigation_prompt,
 )
 from .schema import (
     AgentConfig,
@@ -67,12 +70,14 @@ from .schema import (
     AnalysisTrace,
     DetectionReport,
     EvidenceSummary,
+    InitialAssessment,
     KnowledgeRetrieveRecord,
 )
 
 __all__ = [
     "AgentState",
     "parse_verdict_from_text",
+    "parse_initial_assessment",
     "VulnerabilityDetectionAgent",
 ]
 
@@ -89,6 +94,8 @@ class AgentState(TypedDict):
         "error",
     ]
     knowledge_record: KnowledgeRetrieveRecord | None
+    initial_assessment: InitialAssessment | None
+    gate_opened: bool
     pending_tool_outputs: list[dict[str, Any]]
     verdict: AgentVerdict | None
     report: DetectionReport | None
@@ -160,6 +167,55 @@ def parse_verdict_from_text(text: str) -> AgentVerdict | None:
     return None
 
 
+def parse_initial_assessment(text: str) -> InitialAssessment | None:
+    """从第 1 阶段输出中解析 ``InitialAssessment``（供代码级门控决策）。"""
+    if not text or not text.strip():
+        return None
+    candidates: list[str] = []
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidates.extend(reversed(fenced))
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        candidates.append(stripped)
+    decoder = json.JSONDecoder()
+    for idx in range(len(text) - 1, -1, -1):
+        if text[idx] == "{":
+            try:
+                obj, _ = decoder.raw_decode(text[idx:])
+                if isinstance(obj, dict) and "prediction" in obj:
+                    candidates.append(json.dumps(obj, ensure_ascii=False))
+                    break
+            except json.JSONDecodeError:
+                continue
+
+    for raw in candidates:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict) or "prediction" not in data:
+            continue
+        pred = data.get("prediction")
+        if isinstance(pred, str) and pred.strip() in {"0", "1"}:
+            data["prediction"] = int(pred.strip())
+        for list_field in ("target_symbols", "cwe_candidates", "evidence_cited"):
+            if isinstance(data.get(list_field), str):
+                data[list_field] = [data[list_field]]
+        # 过滤非法符号名，确保门控仅对真实符号放行
+        syms = [
+            str(s).strip()
+            for s in (data.get("target_symbols") or [])
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_:~]*$", str(s).strip())
+        ]
+        data["target_symbols"] = syms[:3]
+        try:
+            return InitialAssessment.model_validate(data)
+        except ValidationError:
+            continue
+    return None
+
+
 class VulnerabilityDetectionAgent:
     """漏洞检测 Agent 编排器（实现 ``VulnerabilityDetector`` 核心接口）。"""
 
@@ -225,6 +281,7 @@ class VulnerabilityDetectionAgent:
             event_type: Literal[
                 "started",
                 "knowledge_retrieved",
+                "gate_decision",
                 "thought",
                 "tool_call",
                 "tool_result",
@@ -295,6 +352,80 @@ class VulnerabilityDetectionAgent:
                 },
             )
             return {"knowledge_record": rec}
+
+        # ------------------------------------------------------------------
+        # 条件边 1：是否走代码级两阶段置信度门控
+        # ------------------------------------------------------------------
+        def route_after_knowledge(
+            state: AgentState,
+        ) -> Literal["initial_analyze", "analyze_and_plan"]:
+            if config.two_stage_gate and use_repo_tools:
+                return "initial_analyze"
+            return "analyze_and_plan"
+
+        # ------------------------------------------------------------------
+        # Node 1.5: 第 1 阶段无工具初判 + 代码级硬门控
+        # ------------------------------------------------------------------
+        def initial_analyze_node(state: AgentState) -> dict[str, Any]:
+            next_step = state["step"] + 1
+            sys_msg = SystemMessage(content=STAGE1_GATE_SYSTEM_PROMPT)
+            usr_msg = HumanMessage(
+                content=build_stage1_user_prompt(
+                    agent_input,
+                    knowledge_record=state.get("knowledge_record"),
+                    max_func_chars=config.max_func_chars,
+                )
+            )
+            # 关键：第 1 阶段物理调用不绑工具的 plain model，杜绝顺手调工具
+            response = model.invoke([sys_msg, usr_msg])
+            if not isinstance(response, AIMessage):
+                response = AIMessage(content=_extract_text_content(response))
+
+            assessment = parse_initial_assessment(_extract_text_content(response.content))
+            should_open = (
+                assessment is not None
+                and assessment.needs_repo_check
+                and assessment.confidence != "high"
+                and len(assessment.target_symbols) > 0
+            )
+            emit(
+                "gate_decision",
+                next_step,
+                {
+                    "gate_opened": should_open,
+                    "preliminary_pred": assessment.prediction if assessment else None,
+                    "confidence": assessment.confidence if assessment else None,
+                    "needs_repo_check": assessment.needs_repo_check if assessment else False,
+                    "target_symbols": assessment.target_symbols if assessment else [],
+                    "open_question": assessment.open_question if assessment else "",
+                },
+            )
+
+            out_messages: list[AnyMessage] = [sys_msg, usr_msg, response]
+            if should_open and assessment is not None:
+                out_messages.append(
+                    HumanMessage(
+                        content=build_stage2_investigation_prompt(
+                            target_symbols=assessment.target_symbols,
+                            open_question=assessment.open_question,
+                        )
+                    )
+                )
+            return {
+                "messages": out_messages,
+                "step": next_step,
+                "initial_assessment": assessment,
+                "gate_opened": should_open,
+            }
+
+        def route_after_initial(
+            state: AgentState,
+        ) -> Literal["analyze_and_plan", "self_verify", "finalize_verdict"]:
+            if state.get("gate_opened"):
+                return "analyze_and_plan"
+            if config.enable_self_check:
+                return "self_verify"
+            return "finalize_verdict"
 
         # ------------------------------------------------------------------
         # Node 2: 初步分析 / 多轮证据规划（核心自主推理节点）
@@ -544,6 +675,8 @@ class VulnerabilityDetectionAgent:
                     "enable_rag": config.enable_rag,
                     "enable_repo_tools": use_repo_tools,
                     "evidence_gated_tools": config.evidence_gated_tools,
+                    "two_stage_gate": config.two_stage_gate,
+                    "gate_opened": state.get("gate_opened", False),
                     "enable_evidence_compactor": compactor is not None,
                     "enable_self_check": config.enable_self_check,
                     "elapsed_ms": elapsed_ms,
@@ -554,6 +687,7 @@ class VulnerabilityDetectionAgent:
 
         graph = StateGraph(AgentState)
         graph.add_node("retrieve_knowledge", retrieve_knowledge_node)
+        graph.add_node("initial_analyze", initial_analyze_node)
         graph.add_node("analyze_and_plan", analyze_and_plan_node)
         graph.add_node("execute_tools", execute_tools_node)
         graph.add_node("compact_evidence", compact_evidence_node)
@@ -562,7 +696,23 @@ class VulnerabilityDetectionAgent:
         graph.add_node("build_report", build_report_node)
 
         graph.add_edge(START, "retrieve_knowledge")
-        graph.add_edge("retrieve_knowledge", "analyze_and_plan")
+        graph.add_conditional_edges(
+            "retrieve_knowledge",
+            route_after_knowledge,
+            {
+                "initial_analyze": "initial_analyze",
+                "analyze_and_plan": "analyze_and_plan",
+            },
+        )
+        graph.add_conditional_edges(
+            "initial_analyze",
+            route_after_initial,
+            {
+                "analyze_and_plan": "analyze_and_plan",
+                "self_verify": "self_verify",
+                "finalize_verdict": "finalize_verdict",
+            },
+        )
         graph.add_conditional_edges(
             "analyze_and_plan",
             route_after_analyze,
@@ -619,6 +769,8 @@ class VulnerabilityDetectionAgent:
             "step": 0,
             "stop_reason": "sufficient_evidence",
             "knowledge_record": None,
+            "initial_assessment": None,
+            "gate_opened": False,
             "pending_tool_outputs": [],
             "verdict": None,
             "report": None,

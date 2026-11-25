@@ -143,10 +143,23 @@ def run_experiment(
     )
 
     def _log_event(ev: AgentEvent) -> None:
-        if ev.event_type in {"knowledge_retrieved", "tool_result", "evidence_compacted", "verdict"}:
+        if ev.event_type in {
+            "knowledge_retrieved",
+            "gate_decision",
+            "tool_result",
+            "evidence_compacted",
+            "verdict",
+        }:
             if ev.event_type == "knowledge_retrieved":
                 hits = [h.get("cve") for h in ev.payload.get("hits", [])]
                 print(f"  [idx={ev.idx}] RAG hits={hits}", flush=True)
+            elif ev.event_type == "gate_decision":
+                print(
+                    f"  [idx={ev.idx}] GATE opened={ev.payload.get('gate_opened')} "
+                    f"pred={ev.payload.get('preliminary_pred')} conf={ev.payload.get('confidence')} "
+                    f"syms={ev.payload.get('target_symbols')}",
+                    flush=True,
+                )
             elif ev.event_type == "tool_result":
                 print(
                     f"  [idx={ev.idx} step={ev.step}] TOOL {ev.payload.get('tool_name')} "
@@ -204,6 +217,20 @@ def run_experiment(
             top_k_knowledge=3,
             rag_min_score=0.18,
             evidence_gated_tools=True,
+            two_stage_gate=False,
+            enable_evidence_compactor=True,
+            compactor_min_chars=600,
+        ),
+        "improved_v3_two_stage": AgentConfig.improved(
+            model_name=model_name,
+            reasoning_effort="low",
+            max_steps=8,
+            max_tool_calls=4,
+            max_read_chars=24000,
+            top_k_knowledge=3,
+            rag_min_score=0.18,
+            evidence_gated_tools=True,
+            two_stage_gate=True,
             enable_evidence_compactor=True,
             compactor_min_chars=600,
         ),
