@@ -784,6 +784,196 @@
           "fixed_tools": 2
         }
       ]
+    },
+    "improved_v2_callchain_compact": {
+      "config": {
+        "mode": "improved",
+        "model_name": "deepseek-flash",
+        "temperature": 0.0,
+        "max_tokens": 2048,
+        "reasoning_effort": "low",
+        "max_steps": 8,
+        "max_tool_calls": 6,
+        "max_read_chars": 30000,
+        "max_func_chars": 18000,
+        "top_k_knowledge": 3,
+        "rag_min_score": 0.18,
+        "enable_rag": true,
+        "enable_repo_tools": true,
+        "evidence_gated_tools": true,
+        "enable_evidence_compactor": true,
+        "compactor_min_chars": 600,
+        "enable_self_check": true
+      },
+      "metrics": {
+        "evaluated_pairs": 12,
+        "evaluated_samples": 24,
+        "P-C": 2,
+        "P-V": 4,
+        "P-B": 6,
+        "P-R": 0,
+        "P-C_rate": 0.1667,
+        "grade": "D",
+        "penalty_applied": false,
+        "tp": 6,
+        "fp": 4,
+        "tn": 8,
+        "fn": 6,
+        "accuracy": 0.5833,
+        "precision": 0.6,
+        "recall": 0.5,
+        "f1": 0.5455,
+        "avg_tool_calls": 4.5,
+        "avg_rag_hits": 3.0,
+        "avg_latency_ms": 76213.1
+      },
+      "official_evaluator_output": "测试集样本数：300\n配对组数：150\n实际评估组数：12\n跳过组数（预测不完整）：138\nP-C（成对正确组数）：2\nP-V（成对漏洞组数）：4\nP-B（成对良性组数）：6\nP-R（成对错误组数）：0",
+      "pair_details": [
+        {
+          "pair_no": 1,
+          "repo": "ImageMagick/ImageMagick6",
+          "function": "ReadPSDChannelPixels",
+          "vuln_idx": 194989,
+          "fixed_idx": 218785,
+          "vuln_pred": 1,
+          "fixed_pred": 0,
+          "category": "P-C",
+          "vuln_tools": 6,
+          "fixed_tools": 6
+        },
+        {
+          "pair_no": 2,
+          "repo": "gpac/gpac",
+          "function": "GetHintFormat",
+          "vuln_idx": 195017,
+          "fixed_idx": 219912,
+          "vuln_pred": 1,
+          "fixed_pred": 1,
+          "category": "P-V",
+          "vuln_tools": 0,
+          "fixed_tools": 6
+        },
+        {
+          "pair_no": 3,
+          "repo": "babelouest/glewlwyd",
+          "function": "callback_glewlwyd_user_auth",
+          "vuln_idx": 195022,
+          "fixed_idx": 219947,
+          "vuln_pred": 0,
+          "fixed_pred": 0,
+          "category": "P-B",
+          "vuln_tools": 4,
+          "fixed_tools": 6
+        },
+        {
+          "pair_no": 4,
+          "repo": "mruby/mruby",
+          "function": "mrb_ary_shift_m",
+          "vuln_idx": 195038,
+          "fixed_idx": 220442,
+          "vuln_pred": 0,
+          "fixed_pred": 0,
+          "category": "P-B",
+          "vuln_tools": 0,
+          "fixed_tools": 2
+        },
+        {
+          "pair_no": 5,
+          "repo": "gpac/gpac",
+          "function": "svc_parse_slice",
+          "vuln_idx": 195069,
+          "fixed_idx": 221079,
+          "vuln_pred": 1,
+          "fixed_pred": 1,
+          "category": "P-V",
+          "vuln_tools": 7,
+          "fixed_tools": 5
+        },
+        {
+          "pair_no": 6,
+          "repo": "gpac/gpac",
+          "function": "gf_odf_av1_cfg_read_bs_size",
+          "vuln_idx": 195074,
+          "fixed_idx": 221160,
+          "vuln_pred": 1,
+          "fixed_pred": 1,
+          "category": "P-V",
+          "vuln_tools": 7,
+          "fixed_tools": 6
+        },
+        {
+          "pair_no": 7,
+          "repo": "facebook/hermes",
+          "function": "hermes::evalUnaryOperator",
+          "vuln_idx": 195092,
+          "fixed_idx": 221651,
+          "vuln_pred": 0,
+          "fixed_pred": 0,
+          "category": "P-B",
+          "vuln_tools": 6,
+          "fixed_tools": 6
+        },
+        {
+          "pair_no": 8,
+          "repo": "e2guardian/e2guardian",
+          "function": "Socket::startSslClient",
+          "vuln_idx": 195095,
+          "fixed_idx": 221678,
+          "vuln_pred": 1,
+          "fixed_pred": 1,
+          "category": "P-V",
+          "vuln_tools": 0,
+          "fixed_tools": 5
+        },
+        {
+          "pair_no": 9,
+          "repo": "tmate-io/tmate-ssh-server",
+          "function": "main",
+          "vuln_idx": 195220,
+          "fixed_idx": 222666,
+          "vuln_pred": 0,
+          "fixed_pred": 0,
+          "category": "P-B",
+          "vuln_tools": 7,
+          "fixed_tools": 3
+        },
+        {
+          "pair_no": 10,
+          "repo": "pjsip/pjproject",
+          "function": "pjmedia_rtcp_xr_rx_rtcp_xr",
+          "vuln_idx": 195230,
+          "fixed_idx": 222737,
+          "vuln_pred": 1,
+          "fixed_pred": 0,
+          "category": "P-C",
+          "vuln_tools": 4,
+          "fixed_tools": 6
+        },
+        {
+          "pair_no": 11,
+          "repo": "ImageMagick/ImageMagick",
+          "function": "ReadPCLImage",
+          "vuln_idx": 195237,
+          "fixed_idx": 223089,
+          "vuln_pred": 0,
+          "fixed_pred": 0,
+          "category": "P-B",
+          "vuln_tools": 0,
+          "fixed_tools": 4
+        },
+        {
+          "pair_no": 12,
+          "repo": "mruby/mruby",
+          "function": "gen_hash",
+          "vuln_idx": 195293,
+          "fixed_idx": 224154,
+          "vuln_pred": 0,
+          "fixed_pred": 0,
+          "category": "P-B",
+          "vuln_tools": 6,
+          "fixed_tools": 6
+        }
+      ]
     }
   }
 }
