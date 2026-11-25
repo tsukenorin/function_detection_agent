@@ -43,6 +43,9 @@ __all__ = [
     "VulnerabilityDetector",
     "TaskServiceProtocol",
     "VulnerabilityDetectionAgent",
+    "DetectionService",
+    "compute_paired_metrics",
+    "compute_grade",
     "write_result_jsonl",
     "write_reports_jsonl",
     "format_report_markdown",
@@ -54,6 +57,10 @@ def __getattr__(name: str):
         from . import agent_loop
 
         return getattr(agent_loop, name)
+    if name in {"DetectionService", "compute_paired_metrics", "compute_grade"}:
+        from . import service
+
+        return getattr(service, name)
     if name in {"write_result_jsonl", "write_reports_jsonl", "format_report_markdown"}:
         from . import report
 
