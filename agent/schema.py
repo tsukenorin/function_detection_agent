@@ -26,6 +26,7 @@ __all__ = [
     "KnowledgeHit",
     "KnowledgeRetrieveRecord",
     "RepoReadRecord",
+    "EvidenceSummary",
     "AnalysisTrace",
     "AgentVerdict",
     "DetectionReport",
@@ -171,6 +172,45 @@ class RepoReadRecord(BaseModel):
     latency_ms: float = Field(default=0.0, ge=0.0, description="工具执行耗时（毫秒）")
 
 
+class EvidenceSummary(BaseModel):
+    """证据摘要压缩子代理提纯后的高密度结构化证据。"""
+
+    tool_name: str = Field(..., description="来源仓库工具名")
+    target: str = Field(default="", description="查证的符号或文件路径")
+    verified_facts: list[str] = Field(
+        default_factory=list, description="带精确文件与行号的核心核验事实（2~4 条）"
+    )
+    guard_status: Literal["guards_present", "guards_missing", "inconclusive", "irrelevant"] = Field(
+        default="inconclusive", description="针对当前审计焦点的守卫状态结论"
+    )
+    next_frontier_symbols: list[str] = Field(
+        default_factory=list,
+        description="若仍 inconclusive，建议下一跳展开的 1~2 个关键外部符号",
+    )
+    filtered_noise_note: str = Field(
+        default="", description="已过滤的无关旁支代码说明"
+    )
+    raw_chars: int = Field(default=0, ge=0, description="压缩前工具原始字符数")
+    compacted_chars: int = Field(default=0, ge=0, description="压缩后进入主代理的字符数")
+
+    def to_compact_message(self) -> str:
+        """渲染成注入主代理 ``ToolMessage`` 的精炼结构化文本。"""
+        lines = [
+            f"[压缩证据 | tool={self.tool_name} | target={self.target or '-'} | guard_status={self.guard_status}]",
+        ]
+        if self.verified_facts:
+            lines.append("核心事实：")
+            for fact in self.verified_facts[:5]:
+                lines.append(f"- {fact}")
+        if self.next_frontier_symbols:
+            lines.append(
+                f"下一跳候选前沿符号（仅在证据仍不足时展开）：{', '.join(self.next_frontier_symbols[:3])}"
+            )
+        if self.filtered_noise_note:
+            lines.append(f"已忽略旁支噪声：{self.filtered_noise_note}")
+        return "\n".join(lines)
+
+
 class AnalysisTrace(BaseModel):
     """系统自动采集的完整分析过程记录（对应报告第四要素）。"""
 
@@ -179,6 +219,9 @@ class AnalysisTrace(BaseModel):
     )
     repo_records: list[RepoReadRecord] = Field(
         default_factory=list, description="代码仓库按需读取记录"
+    )
+    evidence_summaries: list[EvidenceSummary] = Field(
+        default_factory=list, description="证据摘要压缩子代理生成的提纯证据记录"
     )
     tool_calls_count: int = Field(default=0, ge=0, description="实际仓库工具调用总次数")
     total_read_chars: int = Field(default=0, ge=0, description="累计读取字符数")
@@ -277,6 +320,7 @@ class AgentEvent(BaseModel):
         "thought",
         "tool_call",
         "tool_result",
+        "evidence_compacted",
         "self_check",
         "verdict",
         "report_ready",
@@ -304,10 +348,10 @@ class AgentConfig(BaseModel):
     reasoning_effort: Literal["low", "high", "max"] | None = Field(
         default="low", description="推理模型的思考深度配置（兼容 DeepSeek V4 等模型）"
     )
-    max_steps: int = Field(default=6, ge=1, le=20, description="Agent 最大推理步数")
+    max_steps: int = Field(default=8, ge=1, le=20, description="Agent 最大 ReAct 推理步数")
     max_tool_calls: int = Field(default=6, ge=0, le=30, description="仓库工具调用总预算")
     max_read_chars: int = Field(
-        default=24000, ge=1000, description="单样本仓库工具返回总字符预算"
+        default=30000, ge=1000, description="单样本仓库工具原始返回总字符预算"
     )
     max_func_chars: int = Field(
         default=18000, ge=1000, description="传入提示词的函数代码最大字符截断上限"
@@ -322,7 +366,16 @@ class AgentConfig(BaseModel):
     )
     evidence_gated_tools: bool = Field(
         default=True,
-        description="是否启用证据门控策略（函数内证据已充分时零调用，仅对决定性外部符号做外科手术式查证）",
+        description="是否启用证据门控策略（函数内证据已充分时零调用，仅对决定性外部符号做渐进式查证）",
+    )
+    enable_evidence_compactor: bool = Field(
+        default=True,
+        description="是否派遣独立证据摘要压缩子代理提纯大段仓库工具输出",
+    )
+    compactor_min_chars: int = Field(
+        default=600,
+        ge=0,
+        description="触发子代理压缩的原始工具输出最小字符数（低于此值直接透传）",
     )
     enable_self_check: bool = Field(
         default=True, description="是否启用防御检查核验与反事实自检节点"
@@ -330,15 +383,17 @@ class AgentConfig(BaseModel):
 
     @classmethod
     def baseline(cls, **overrides: Any) -> AgentConfig:
-        """Baseline 配置：孤立函数直接检测（无 RAG、无仓库工具、无自检节点）。"""
+        """Baseline 配置：孤立函数直接检测（无 RAG、无仓库工具、无压缩子代理、无自检）。"""
         defaults: dict[str, Any] = {
             "mode": "baseline",
+            "reasoning_effort": "low",
             "max_steps": 2,
             "max_tool_calls": 0,
             "top_k_knowledge": 0,
             "enable_rag": False,
             "enable_repo_tools": False,
             "evidence_gated_tools": False,
+            "enable_evidence_compactor": False,
             "enable_self_check": False,
         }
         defaults.update(overrides)
@@ -346,16 +401,20 @@ class AgentConfig(BaseModel):
 
     @classmethod
     def improved(cls, **overrides: Any) -> AgentConfig:
-        """Improved 配置：历史 CVE RAG + 证据门控按需仓库工具 + 防御核验自检。"""
+        """Improved 配置：模式卡混合 RAG + 渐进式 Tree-sitter 调用链 + 证据压缩子代理 + 防御自检。"""
         defaults: dict[str, Any] = {
             "mode": "improved",
-            "max_steps": 5,
-            "max_tool_calls": 2,
-            "max_read_chars": 6000,
+            "reasoning_effort": "low",
+            "max_steps": 8,
+            "max_tool_calls": 6,
+            "max_read_chars": 30000,
             "top_k_knowledge": 3,
+            "rag_min_score": 0.18,
             "enable_rag": True,
             "enable_repo_tools": True,
             "evidence_gated_tools": True,
+            "enable_evidence_compactor": True,
+            "compactor_min_chars": 600,
             "enable_self_check": True,
         }
         defaults.update(overrides)

@@ -23,6 +23,7 @@ from .schema import (
     AgentEvent,
     AgentInput,
     DetectionReport,
+    EvidenceSummary,
     KnowledgeRetrieveRecord,
     RawSample,
     RepoRef,
@@ -34,6 +35,7 @@ __all__ = [
     "ParentCommitResolver",
     "SnapshotProvider",
     "SampleLoaderProtocol",
+    "EvidenceCompactorProtocol",
     "VulnerabilityDetector",
     "TaskServiceProtocol",
 ]
@@ -81,6 +83,23 @@ class SampleLoaderProtocol(Protocol):
 
     def load(self, raw: RawSample) -> tuple[AgentInput, RepoRef]:
         """校验样本、解析允许访问的版本 SHA，并裁剪掉 ``target`` 后返回。"""
+        ...
+
+
+@runtime_checkable
+class EvidenceCompactorProtocol(Protocol):
+    """证据摘要压缩子代理协议：将大段仓库工具原始输出提纯为高密度结构化事实。"""
+
+    def compact(
+        self,
+        *,
+        function_name: str,
+        audit_focus: str,
+        tool_name: str,
+        tool_args: dict[str, object],
+        raw_output: str,
+    ) -> EvidenceSummary:
+        """把单次仓库工具原始输出压缩为带精确行号的 ``EvidenceSummary``。"""
         ...
 
 
