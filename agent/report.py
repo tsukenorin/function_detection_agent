@@ -86,10 +86,12 @@ def format_report_markdown(report: DetectionReport) -> str:
         lines.extend(["", "#### 3. 证据摘要压缩子代理提纯记录"])
         for ev in trace.evidence_summaries:
             lines.append(
-                f"- `{ev.tool_name}` ({ev.target or '-'}) [{ev.guard_status}] "
+                f"- `{ev.tool_name}` ({ev.target or '-'}) [{ev.evidence_completeness}] "
                 f"{ev.raw_chars} -> {ev.compacted_chars} chars"
             )
             for fact in ev.verified_facts[:3]:
                 lines.append(f"  - {fact}")
+            for cl in ev.key_code_lines[:3]:
+                lines.append(f"  - `{cl}`")
 
     return "\n".join(lines) + "\n"

@@ -173,19 +173,28 @@ class RepoReadRecord(BaseModel):
 
 
 class EvidenceSummary(BaseModel):
-    """证据摘要压缩子代理提纯后的高密度结构化证据。"""
+    """证据摘要压缩子代理提纯后的纯客观高密度证据（不做安全定性裁决）。"""
 
     tool_name: str = Field(..., description="来源仓库工具名")
     target: str = Field(default="", description="查证的符号或文件路径")
     verified_facts: list[str] = Field(
-        default_factory=list, description="带精确文件与行号的核心核验事实（2~4 条）"
+        default_factory=list, description="带精确文件与行号的纯客观事实（2~4 条，不含安全定性）"
     )
-    guard_status: Literal["guards_present", "guards_missing", "inconclusive", "irrelevant"] = Field(
-        default="inconclusive", description="针对当前审计焦点的守卫状态结论"
+    key_code_lines: list[str] = Field(
+        default_factory=list,
+        description="原样摘录的最关键 1~5 行 C/C++ 代码（含 path:line，供主代理亲自判断）",
+    )
+    evidence_completeness: Literal["sufficient", "needs_more_hops", "irrelevant"] = Field(
+        default="needs_more_hops",
+        description="仅描述是否已找到目标符号/调用链信息，不代表代码是否安全",
+    )
+    guard_status: Literal["neutral", "guards_present", "guards_missing", "inconclusive", "irrelevant"] = Field(
+        default="neutral",
+        description="向后兼容字段；纯客观模式下恒为 neutral，判断权完全留给主代理",
     )
     next_frontier_symbols: list[str] = Field(
         default_factory=list,
-        description="若仍 inconclusive，建议下一跳展开的 1~2 个关键外部符号",
+        description="仅当 evidence_completeness=needs_more_hops 时建议下一跳展开的 1~2 个符号",
     )
     filtered_noise_note: str = Field(
         default="", description="已过滤的无关旁支代码说明"
@@ -194,17 +203,21 @@ class EvidenceSummary(BaseModel):
     compacted_chars: int = Field(default=0, ge=0, description="压缩后进入主代理的字符数")
 
     def to_compact_message(self) -> str:
-        """渲染成注入主代理 ``ToolMessage`` 的精炼结构化文本。"""
+        """渲染成注入主代理 ``ToolMessage`` 的纯客观精炼证据（绝不含定性偏置）。"""
         lines = [
-            f"[压缩证据 | tool={self.tool_name} | target={self.target or '-'} | guard_status={self.guard_status}]",
+            f"[压缩客观证据 | tool={self.tool_name} | target={self.target or '-'} | completeness={self.evidence_completeness}]",
         ]
         if self.verified_facts:
-            lines.append("核心事实：")
+            lines.append("客观事实：")
             for fact in self.verified_facts[:5]:
                 lines.append(f"- {fact}")
+        if self.key_code_lines:
+            lines.append("关键原代码行摘录（请主代理自行判断防御是否充分）：")
+            for code_line in self.key_code_lines[:6]:
+                lines.append(f"  {code_line}")
         if self.next_frontier_symbols:
             lines.append(
-                f"下一跳候选前沿符号（仅在证据仍不足时展开）：{', '.join(self.next_frontier_symbols[:3])}"
+                f"下一跳候选前沿符号（仅在仍缺关键定义时展开）：{', '.join(self.next_frontier_symbols[:2])}"
             )
         if self.filtered_noise_note:
             lines.append(f"已忽略旁支噪声：{self.filtered_noise_note}")
