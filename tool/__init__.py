@@ -42,4 +42,8 @@ def __getattr__(name: str):
         from . import trace
 
         return getattr(trace, name)
+    if name in {"CallGraphAnalyzer", "parse_function_dependencies", "MAX_CALLCHAIN_DEPTH"}:
+        from . import callgraph
+
+        return getattr(callgraph, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
