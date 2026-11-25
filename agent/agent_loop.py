@@ -293,6 +293,7 @@ class VulnerabilityDetectionAgent:
                             agent_input,
                             knowledge_record=state.get("knowledge_record"),
                             has_repo_tools=use_repo_tools,
+                            evidence_gated_tools=config.evidence_gated_tools,
                             max_func_chars=config.max_func_chars,
                         )
                     )
@@ -461,6 +462,7 @@ class VulnerabilityDetectionAgent:
                     "function_name": agent_input.function_name,
                     "enable_rag": config.enable_rag,
                     "enable_repo_tools": use_repo_tools,
+                    "evidence_gated_tools": config.evidence_gated_tools,
                     "enable_self_check": config.enable_self_check,
                     "elapsed_ms": elapsed_ms,
                 },

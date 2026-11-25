@@ -236,3 +236,20 @@ def test_budget_exhausted_forces_termination_and_json_repair(sample_ws, tmp_path
     assert json.loads(rep_file.read_text(encoding="utf-8").strip())["label_text"] == "有漏洞"
     md = format_report_markdown(report)
     assert "idx=103" in md and "历史 CVE 知识库检索记录" in md and "代码仓库按需读取记录" in md
+
+
+def test_evidence_gated_config_and_prompt_directive():
+    from agent.prompts import build_improved_user_prompt
+
+    cfg = AgentConfig.improved()
+    assert cfg.evidence_gated_tools is True
+    assert cfg.max_tool_calls == 2
+    assert cfg.max_read_chars == 6000
+
+    prompt = build_improved_user_prompt(
+        AgentInput(idx=1, func="int f() { return 0; }", repo_name="org/demo"),
+        has_repo_tools=True,
+        evidence_gated_tools=True,
+    )
+    assert "严格证据门控策略" in prompt
+    assert "默认 0 次调用" in prompt

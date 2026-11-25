@@ -288,8 +288,12 @@ class AgentConfig(BaseModel):
     mode: Literal["baseline", "improved"] = Field(
         default="improved", description="运行策略模式"
     )
-    model_name: str = Field(default="deepseek-chat", description="LLM 模型名称")
+    model_name: str = Field(default="deepseek-flash", description="LLM 模型名称")
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=2048, ge=128, le=16384, description="单次 LLM 输出最大 token 数")
+    reasoning_effort: Literal["low", "high", "max"] | None = Field(
+        default="low", description="推理模型的思考深度配置（兼容 DeepSeek V4 等模型）"
+    )
     max_steps: int = Field(default=6, ge=1, le=20, description="Agent 最大推理步数")
     max_tool_calls: int = Field(default=6, ge=0, le=30, description="仓库工具调用总预算")
     max_read_chars: int = Field(
@@ -302,6 +306,10 @@ class AgentConfig(BaseModel):
     enable_rag: bool = Field(default=True, description="是否启用历史 CVE 领域知识库 RAG")
     enable_repo_tools: bool = Field(
         default=True, description="是否启用代码仓库按需上下文挖掘工具"
+    )
+    evidence_gated_tools: bool = Field(
+        default=True,
+        description="是否启用证据门控策略（函数内证据已充分时零调用，仅对决定性外部符号做外科手术式查证）",
     )
     enable_self_check: bool = Field(
         default=True, description="是否启用防御检查核验与反事实自检节点"
@@ -317,6 +325,7 @@ class AgentConfig(BaseModel):
             "top_k_knowledge": 0,
             "enable_rag": False,
             "enable_repo_tools": False,
+            "evidence_gated_tools": False,
             "enable_self_check": False,
         }
         defaults.update(overrides)
@@ -324,14 +333,16 @@ class AgentConfig(BaseModel):
 
     @classmethod
     def improved(cls, **overrides: Any) -> AgentConfig:
-        """Improved 配置：历史 CVE RAG + 按需仓库工具挖掘 + 防御核验自检。"""
+        """Improved 配置：历史 CVE RAG + 证据门控按需仓库工具 + 防御核验自检。"""
         defaults: dict[str, Any] = {
             "mode": "improved",
-            "max_steps": 6,
-            "max_tool_calls": 6,
+            "max_steps": 5,
+            "max_tool_calls": 2,
+            "max_read_chars": 6000,
             "top_k_knowledge": 3,
             "enable_rag": True,
             "enable_repo_tools": True,
+            "evidence_gated_tools": True,
             "enable_self_check": True,
         }
         defaults.update(overrides)
