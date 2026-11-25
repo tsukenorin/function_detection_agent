@@ -135,6 +135,16 @@ class KnowledgeHit(BaseModel):
         default="",
         description="成对历史案例提炼出的修复差异摘要（展示了漏洞与修复的关键区别）",
     )
+    pattern_card: str = Field(
+        default="",
+        description="离线提炼的结构化漏洞模式卡（危险原语 + 新增守卫类型）",
+    )
+    sink_tags: list[str] = Field(
+        default_factory=list, description="识别出的 C/C++ 危险原语标签"
+    )
+    guard_tags: list[str] = Field(
+        default_factory=list, description="历史补丁新增的防御守卫标签"
+    )
     vuln_snippet: str = Field(default="", description="历史漏洞版关键片段")
     fixed_snippet: str = Field(default="", description="历史修复版关键片段")
 
@@ -303,6 +313,9 @@ class AgentConfig(BaseModel):
         default=18000, ge=1000, description="传入提示词的函数代码最大字符截断上限"
     )
     top_k_knowledge: int = Field(default=3, ge=0, le=10, description="RAG 检索返回案例数")
+    rag_min_score: float = Field(
+        default=0.18, ge=0.0, le=1.0, description="RAG 相关性最低阈值（低于阈值宁缺毋滥）"
+    )
     enable_rag: bool = Field(default=True, description="是否启用历史 CVE 领域知识库 RAG")
     enable_repo_tools: bool = Field(
         default=True, description="是否启用代码仓库按需上下文挖掘工具"

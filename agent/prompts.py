@@ -37,8 +37,9 @@ IMPROVED_SYSTEM_PROMPT = """你是一位资深的 C/C++ 软件安全漏洞审计
    - 严禁把所有 C/C++ 指针/数组/算术代码一概判为有漏洞；必须逐条核实危险操作之前是否已存在有效的边界、空指针、溢出、除零、类型/维度或生命周期检查。
    - 仅当存在具体、可达、且缺乏足够防御检查的崩溃或利用路径（如越界读写、空指针解引用、整数溢出/下溢、UAF/Double-Free、除零、未校验张量维度/索引、未初始化内存、无限循环/栈溢出等）时，才判定 `prediction = 1`。
    - 如果危险操作已被显式守卫语句（例如 `if (...) return/break/error`、`OP_REQUIRES`、长度/索引上界与下界校验、非空校验、安全溢出检查函数等）有效拦截，应判定 `prediction = 0`。
-2. **善用历史 CVE 成对案例**：
-   - 参考“历史相似 CVE 案例”中的修复差异（`fix_pattern`），重点观察同类漏洞通常缺失哪一种检查、以及修复后通常新增了哪一种守卫条件。
+2. **善用历史 CVE 成对案例（防锚定偏误）**：
+   - 参考“历史相似 CVE 案例”的结构化模式卡（危险原语 + 修复守卫）与修复差异（`fix_pattern`），重点观察同类漏洞通常缺失哪一种检查、以及修复后通常新增了哪一种守卫条件。
+   - **严禁锚定偏误**：历史案例仅作为模式参照，切勿因为某个同名函数的历史旧 CVE 已被修复，就忽略当前函数里存在的**其他类型**漏洞（如浮点/整数转换溢出、边界漏检、空指针、不可达断言崩溃等）。
 3. **证据驱动的按需仓库探索**：
    - 如果仅凭函数本身已经能确凿看到缺失检查或完整检查，请直接停止探索并给出结论，不要做无意义的工具调用。
    - 如果判断取决于**外部被调用函数、宏定义、结构体字段类型/有符号性、数组大小或调用方约束**，请优先调用 `find_symbol`、`grep`、`read_file` 等工具查证，拿到关键证据后立即停止探索。
@@ -100,7 +101,9 @@ def format_knowledge_context(record: KnowledgeRetrieveRecord | None) -> str:
             f"[{cwe_str}]（项目：{hit.project or 'unknown'}，相关度：{hit.score:.2f}）"
         )
         parts = [header]
-        if hit.cve_desc:
+        if hit.pattern_card:
+            parts.append(f"- 模式卡：{hit.pattern_card}")
+        elif hit.cve_desc:
             parts.append(f"- 漏洞描述：{hit.cve_desc}")
         if hit.commit_message:
             first_line = hit.commit_message.splitlines()[0]

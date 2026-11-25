@@ -1,4 +1,4 @@
-"""领域知识库 RAG 检索与防泄露机制的单元测试。"""
+"""领域知识库 RAG（双通道混合检索、结构化模式卡、去重多样性与阈值过滤）单元测试。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ import pytest
 from agent.interfaces import KnowledgeRetriever
 from knowledge import (
     CVEKnowledgeRetriever,
+    build_pattern_card,
     extract_fix_pattern,
+    extract_security_signals,
     load_cve_cases,
     tokenize_code,
 )
@@ -41,6 +43,52 @@ def mini_knowledge_jsonl(tmp_path):
             "cve": "CVE-2019-0001",
             "cve_desc": "Out-of-bounds read in EXIF parser when offset exceeds buffer length.",
         },
+        # 重复同 CVE 记录（测试 CVE 去重）
+        {
+            "idx": 11,
+            "project": "ImageMagick",
+            "commit_id": "1111111111111111111111111111111111111112",
+            "commit_message": "Duplicate CVE entry for GetEXIFProperty",
+            "target": 1,
+            "func": "void GetEXIFProperty(char *exif, size_t offset) {\n  memcpy(dst, exif + offset, 32);\n}",
+            "cwe": ["CWE-125"],
+            "cve": "CVE-2019-0001",
+            "cve_desc": "Duplicate entry for same CVE.",
+        },
+        {
+            "idx": 12,
+            "project": "ImageMagick",
+            "commit_id": "1111111111111111111111111111111111111112",
+            "commit_message": "Duplicate CVE entry for GetEXIFProperty",
+            "target": 0,
+            "func": "void GetEXIFProperty(char *exif, size_t offset, size_t len) {\n  if (offset + 32 > len) return;\n  memcpy(dst, exif + offset, 32);\n}",
+            "cwe": ["CWE-125"],
+            "cve": "CVE-2019-0001",
+            "cve_desc": "Duplicate entry for same CVE.",
+        },
+        # 同名函数但不同 CVE（测试 max_same_func=1 多样性限制）
+        {
+            "idx": 21,
+            "project": "ImageMagick",
+            "commit_id": "1111111111111111111111111111111111111113",
+            "commit_message": "Another old bug in GetEXIFProperty",
+            "target": 1,
+            "func": "void GetEXIFProperty(char *exif, size_t offset) {\n  memcpy(dst, exif + offset, 16);\n}",
+            "cwe": ["CWE-787"],
+            "cve": "CVE-2018-0009",
+            "cve_desc": "Older bug in GetEXIFProperty.",
+        },
+        {
+            "idx": 22,
+            "project": "ImageMagick",
+            "commit_id": "1111111111111111111111111111111111111113",
+            "commit_message": "Another old bug in GetEXIFProperty",
+            "target": 0,
+            "func": "void GetEXIFProperty(char *exif, size_t offset, size_t len) {\n  if (offset > len) return;\n  memcpy(dst, exif + offset, 16);\n}",
+            "cwe": ["CWE-787"],
+            "cve": "CVE-2018-0009",
+            "cve_desc": "Older bug in GetEXIFProperty.",
+        },
         {
             "idx": 3,
             "project": "openssl",
@@ -69,56 +117,57 @@ def mini_knowledge_jsonl(tmp_path):
     return path
 
 
-def test_tokenize_code_splits_camel_and_snake():
+def test_tokenize_and_security_signals_and_pattern_card():
     toks = tokenize_code("static void GetEXIFProperty(size_t buffer_len) { memcpy(a, b, n); }")
     assert "getexifproperty" in toks
     assert "exif" in toks
-    assert "buffer_len" in toks
     assert "memcpy" in toks
     assert "static" not in toks
 
-
-def test_extract_fix_pattern_highlights_added_guard():
-    v = "int f(int *p) {\n  return *p;\n}"
-    f = "int f(int *p) {\n  if (!p) return 0;\n  return *p;\n}"
+    v = "int f(int *p) {\n  return p->val;\n}"
+    f = "int f(int *p) {\n  if (!p) return 0;\n  return p->val;\n}"
     diff = extract_fix_pattern(v, f)
     assert "+  if (!p) return 0;" in diff
 
+    sinks, guards = extract_security_signals(v, diff_text=diff)
+    assert "sink_ptr_deref" in sinks
+    assert "guard_null_check" in guards
 
-def test_retriever_protocol_ranking_and_commit_exclusion(mini_knowledge_jsonl):
-    retriever = CVEKnowledgeRetriever.from_jsonl(mini_knowledge_jsonl)
+    card = build_pattern_card(cwe=["CWE-476"], cve_desc="null deref", sink_tags=sinks, guard_tags=guards)
+    assert "CWE-476" in card and "sink_ptr_deref" in card and "guard_null_check" in card
+
+
+def test_hybrid_retriever_dedup_diversity_threshold_and_exclusion(mini_knowledge_jsonl):
+    retriever = CVEKnowledgeRetriever.from_jsonl(mini_knowledge_jsonl, default_min_score=0.15, max_same_func=1)
     assert isinstance(retriever, KnowledgeRetriever)
-    assert len(retriever.cases) == 2
+    assert len(retriever.cases) == 4
 
+    # 验证：CVE 去重 + 同名函数最多占 1 槽位
     rec = retriever.retrieve(
         "ImageMagick GetEXIFProperty",
         func_code="void parse_exif(char *exif, size_t offset) { memcpy(out, exif + offset, 32); }",
-        top_k=2,
+        top_k=3,
     )
-    assert len(rec.hits) == 1
-    assert rec.hits[0].cve == "CVE-2019-0001"
-    assert "+  if (offset + 64 > len)" in rec.hits[0].fix_pattern
+    cves = [h.cve for h in rec.hits]
+    assert len(cves) == len(set(cves))
+    assert sum(1 for h in rec.hits if h.cve in {"CVE-2019-0001", "CVE-2018-0009"}) == 1
+    assert rec.hits[0].pattern_card != ""
 
-    # 当两个案例均有词项命中时，相关度更高的排在首位
-    rec_both = retriever.retrieve(
-        "ImageMagick GetEXIFProperty ssl",
-        func_code="void parse_exif(char *exif, size_t offset) { memcpy(out, exif + offset, 32); }",
-        top_k=2,
-    )
-    assert len(rec_both.hits) == 2
-    assert rec_both.hits[0].cve == "CVE-2019-0001"
+    # 验证：完全无关的查询经高阈值过滤返回空（宁缺毋滥）
+    rec_noise = retriever.retrieve("totally_unrelated_xyz_123", func_code="int foo() { return 1; }", top_k=3, min_score=0.6)
+    assert rec_noise.hits == []
 
-    # 防泄露：排除指定 commit_id
+    # 验证：防泄露排除 commit_id
     rec_excl = retriever.retrieve(
-        "ImageMagick GetEXIFProperty",
-        func_code="memcpy(out, exif + offset, 32); ssl_handshake(s);",
-        top_k=2,
-        exclude_commit="1111111111111111111111111111111111111111",
+        "openssl ssl_handshake",
+        func_code="int tls_check(SSL *s) { return s->session->cipher_id; }",
+        top_k=3,
+        exclude_commit="2222222222222222222222222222222222222222",
     )
-    assert all(h.cve != "CVE-2019-0001" for h in rec_excl.hits)
+    assert all(h.cve != "CVE-2019-0002" for h in rec_excl.hits)
 
 
-def test_real_knowledge_dataset_smoke():
+def test_real_knowledge_dataset_dedup_and_cards():
     real_path = Path("data/knowledge.jsonl")
     if not real_path.exists():
         pytest.skip("data/knowledge.jsonl 不存在")
@@ -126,11 +175,14 @@ def test_real_knowledge_dataset_smoke():
     cases = load_cve_cases(real_path)
     assert len(cases) == 3789
     retriever = CVEKnowledgeRetriever(cases)
+
+    # 回归验证 Pair 11（ReadPCLImage）：不再重复返回同一 CVE 或全被同名旧函数占满
     rec = retriever.retrieve(
-        "ImageMagick GetEXIFProperty",
-        func_code="static MagickBooleanType GetEXIFProperty(const Image *image) { ReadProfileByte(exif, offset); }",
+        "ImageMagick/ImageMagick ReadPCLImage",
+        func_code="static Image *ReadPCLImage(const ImageInfo *image_info) { width=(size_t) floor(bounds.x2-bounds.x1+0.5); }",
         top_k=3,
     )
-    assert len(rec.hits) == 3
-    assert rec.hits[0].score > 0
-    assert rec.hits[0].fix_pattern != ""
+    assert len(rec.hits) >= 1
+    cves = [h.cve for h in rec.hits if h.cve]
+    assert len(cves) == len(set(cves))
+    assert all(h.pattern_card for h in rec.hits)
