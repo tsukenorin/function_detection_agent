@@ -244,11 +244,19 @@ class VulnerabilityDetectionAgent:
                 for p in (agent_input.repo_name, agent_input.function_name or "")
                 if p
             ) or f"sample_{agent_input.idx}"
-            rec = self.retriever.retrieve(
-                query,
-                func_code=agent_input.func,
-                top_k=config.top_k_knowledge,
-            )
+            try:
+                rec = self.retriever.retrieve(
+                    query,
+                    func_code=agent_input.func,
+                    top_k=config.top_k_knowledge,
+                    min_score=config.rag_min_score,
+                )
+            except TypeError:
+                rec = self.retriever.retrieve(
+                    query,
+                    func_code=agent_input.func,
+                    top_k=config.top_k_knowledge,
+                )
             knowledge_records.append(rec)
             emit(
                 "knowledge_retrieved",
