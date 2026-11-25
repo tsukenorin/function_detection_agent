@@ -27,6 +27,7 @@ __all__ = [
     "KnowledgeRetrieveRecord",
     "RepoReadRecord",
     "EvidenceSummary",
+    "InitialAssessment",
     "AnalysisTrace",
     "AgentVerdict",
     "DetectionReport",
@@ -224,6 +225,37 @@ class EvidenceSummary(BaseModel):
         return "\n".join(lines)
 
 
+class InitialAssessment(BaseModel):
+    """两阶段代码门控中第 1 阶段（无仓库工具）的结构化初判结果。"""
+
+    prediction: Literal[0, 1] = Field(..., description="初判结果：1=有漏洞，0=无漏洞")
+    confidence: Literal["high", "medium", "low"] = Field(
+        default="medium", description="初判置信度；high 将直接关闭仓库门控"
+    )
+    needs_repo_check: bool = Field(
+        default=False, description="是否需要进入第 2 阶段代码仓库查证"
+    )
+    target_symbols: list[str] = Field(
+        default_factory=list,
+        description="需要查证的 1~2 个具体外部符号名（函数/结构体/宏），为空则不开启门控",
+    )
+    open_question: str = Field(
+        default="", description="第 2 阶段需回答的单一核心问题"
+    )
+    cwe_candidates: list[str] = Field(default_factory=list)
+    reason: str = Field(default="")
+    evidence_cited: list[str] = Field(default_factory=list)
+    guard_assessment: str = Field(default="")
+
+    @field_validator("prediction", mode="before")
+    @classmethod
+    def _validate_prediction(cls, v: Any) -> int:
+        val = _ensure_strict_int(v, "prediction")
+        if val not in (0, 1):
+            raise ValueError("prediction 必须为 0 或 1")
+        return val
+
+
 class AnalysisTrace(BaseModel):
     """系统自动采集的完整分析过程记录（对应报告第四要素）。"""
 
@@ -330,6 +362,7 @@ class AgentEvent(BaseModel):
     event_type: Literal[
         "started",
         "knowledge_retrieved",
+        "gate_decision",
         "thought",
         "tool_call",
         "tool_result",
@@ -381,6 +414,10 @@ class AgentConfig(BaseModel):
         default=True,
         description="是否启用证据门控策略（函数内证据已充分时零调用，仅对决定性外部符号做渐进式查证）",
     )
+    two_stage_gate: bool = Field(
+        default=True,
+        description="是否启用代码级两阶段置信度门控（第 1 阶段物理不绑工具，仅存疑且指定外部符号时才开仓）",
+    )
     enable_evidence_compactor: bool = Field(
         default=True,
         description="是否派遣独立证据摘要压缩子代理提纯大段仓库工具输出",
@@ -406,6 +443,7 @@ class AgentConfig(BaseModel):
             "enable_rag": False,
             "enable_repo_tools": False,
             "evidence_gated_tools": False,
+            "two_stage_gate": False,
             "enable_evidence_compactor": False,
             "enable_self_check": False,
         }
@@ -414,18 +452,19 @@ class AgentConfig(BaseModel):
 
     @classmethod
     def improved(cls, **overrides: Any) -> AgentConfig:
-        """Improved 配置：模式卡混合 RAG + 渐进式 Tree-sitter 调用链 + 证据压缩子代理 + 防御自检。"""
+        """Improved 配置：模式卡混合 RAG + 两阶段代码门控 + 渐进式 Tree-sitter 调用链 + 纯客观压缩子代理 + 防御自检。"""
         defaults: dict[str, Any] = {
             "mode": "improved",
             "reasoning_effort": "low",
             "max_steps": 8,
-            "max_tool_calls": 6,
-            "max_read_chars": 30000,
+            "max_tool_calls": 4,
+            "max_read_chars": 24000,
             "top_k_knowledge": 3,
             "rag_min_score": 0.18,
             "enable_rag": True,
             "enable_repo_tools": True,
             "evidence_gated_tools": True,
+            "two_stage_gate": True,
             "enable_evidence_compactor": True,
             "compactor_min_chars": 600,
             "enable_self_check": True,

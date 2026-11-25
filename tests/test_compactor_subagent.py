@@ -189,7 +189,7 @@ def test_multihop_callchain_with_neutral_compactor_keeps_main_context_lean(two_h
     events = []
     compactor = EvidenceCompactorSubAgent(model=sub_model, min_chars=50)
     agent = VulnerabilityDetectionAgent(model=main_model, compactor=compactor)
-    cfg = AgentConfig.improved(enable_rag=False, compactor_min_chars=50)
+    cfg = AgentConfig.improved(enable_rag=False, two_stage_gate=False, compactor_min_chars=50)
 
     report = agent.detect(
         AgentInput(

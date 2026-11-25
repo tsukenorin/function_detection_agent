@@ -119,7 +119,12 @@ def test_detection_service_end_to_end_pair_isolation_yields_pc(tmp_path):
     report_file = tmp_path / "reports.jsonl"
     reports = service.detect_batch(
         samples,
-        config=AgentConfig.improved(enable_rag=False, enable_self_check=False),
+        config=AgentConfig.improved(
+            enable_rag=False,
+            enable_self_check=False,
+            two_stage_gate=False,
+            enable_evidence_compactor=False,
+        ),
         result_path=result_file,
         report_path=report_file,
         max_workers=2,
