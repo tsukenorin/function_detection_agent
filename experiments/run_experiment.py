@@ -143,7 +143,7 @@ def run_experiment(
     )
 
     def _log_event(ev: AgentEvent) -> None:
-        if ev.event_type in {"knowledge_retrieved", "tool_result", "verdict"}:
+        if ev.event_type in {"knowledge_retrieved", "tool_result", "evidence_compacted", "verdict"}:
             if ev.event_type == "knowledge_retrieved":
                 hits = [h.get("cve") for h in ev.payload.get("hits", [])]
                 print(f"  [idx={ev.idx}] RAG hits={hits}", flush=True)
@@ -151,6 +151,14 @@ def run_experiment(
                 print(
                     f"  [idx={ev.idx} step={ev.step}] TOOL {ev.payload.get('tool_name')} "
                     f"ok={ev.payload.get('ok')} -> {ev.payload.get('summary')}",
+                    flush=True,
+                )
+            elif ev.event_type == "evidence_compacted":
+                print(
+                    f"  [idx={ev.idx} step={ev.step}] COMPACT {ev.payload.get('tool_name')} "
+                    f"status={ev.payload.get('guard_status')} "
+                    f"{ev.payload.get('raw_chars')}->{ev.payload.get('compacted_chars')} chars "
+                    f"next={ev.payload.get('next_frontier_symbols')}",
                     flush=True,
                 )
             elif ev.event_type == "verdict":
@@ -166,6 +174,7 @@ def run_experiment(
             model_name=model_name,
             enable_repo_tools=False,
             evidence_gated_tools=False,
+            enable_evidence_compactor=False,
             max_tool_calls=0,
         ),
         "improved_eager_repo": AgentConfig.improved(
@@ -175,6 +184,7 @@ def run_experiment(
             max_read_chars=18000,
             top_k_knowledge=3,
             evidence_gated_tools=False,
+            enable_evidence_compactor=False,
         ),
         "improved_gated": AgentConfig.improved(
             model_name=model_name,
@@ -183,6 +193,19 @@ def run_experiment(
             max_read_chars=6000,
             top_k_knowledge=3,
             evidence_gated_tools=True,
+            enable_evidence_compactor=False,
+        ),
+        "improved_v2_callchain_compact": AgentConfig.improved(
+            model_name=model_name,
+            reasoning_effort="low",
+            max_steps=8,
+            max_tool_calls=6,
+            max_read_chars=30000,
+            top_k_knowledge=3,
+            rag_min_score=0.18,
+            evidence_gated_tools=True,
+            enable_evidence_compactor=True,
+            compactor_min_chars=600,
         ),
     }
 

@@ -243,13 +243,16 @@ def test_evidence_gated_config_and_prompt_directive():
 
     cfg = AgentConfig.improved()
     assert cfg.evidence_gated_tools is True
-    assert cfg.max_tool_calls == 2
-    assert cfg.max_read_chars == 6000
+    assert cfg.enable_evidence_compactor is True
+    assert cfg.reasoning_effort == "low"
+    assert cfg.max_steps == 8
+    assert cfg.max_tool_calls == 6
+    assert cfg.max_read_chars == 30000
 
     prompt = build_improved_user_prompt(
         AgentInput(idx=1, func="int f() { return 0; }", repo_name="org/demo"),
         has_repo_tools=True,
         evidence_gated_tools=True,
     )
-    assert "严格证据门控策略" in prompt
+    assert "渐进式调用链策略" in prompt
     assert "默认 0 次调用" in prompt

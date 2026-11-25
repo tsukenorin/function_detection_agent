@@ -2,6 +2,7 @@
 
 from .interfaces import (
     EventCallback,
+    EvidenceCompactorProtocol,
     KnowledgeRetriever,
     ParentCommitResolver,
     SampleLoaderProtocol,
@@ -16,6 +17,7 @@ from .schema import (
     AgentVerdict,
     AnalysisTrace,
     DetectionReport,
+    EvidenceSummary,
     KnowledgeHit,
     KnowledgeRetrieveRecord,
     RawSample,
@@ -30,6 +32,7 @@ __all__ = [
     "KnowledgeHit",
     "KnowledgeRetrieveRecord",
     "RepoReadRecord",
+    "EvidenceSummary",
     "AnalysisTrace",
     "AgentVerdict",
     "DetectionReport",
@@ -40,9 +43,11 @@ __all__ = [
     "ParentCommitResolver",
     "SnapshotProvider",
     "SampleLoaderProtocol",
+    "EvidenceCompactorProtocol",
     "VulnerabilityDetector",
     "TaskServiceProtocol",
     "VulnerabilityDetectionAgent",
+    "EvidenceCompactorSubAgent",
     "DetectionService",
     "compute_paired_metrics",
     "compute_grade",
@@ -57,6 +62,10 @@ def __getattr__(name: str):
         from . import agent_loop
 
         return getattr(agent_loop, name)
+    if name in {"EvidenceCompactorSubAgent"}:
+        from . import compactor
+
+        return getattr(compactor, name)
     if name in {"DetectionService", "compute_paired_metrics", "compute_grade"}:
         from . import service
 

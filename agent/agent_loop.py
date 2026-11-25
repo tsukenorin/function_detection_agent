@@ -48,7 +48,8 @@ from tool.file_tools import build_repo_tools
 from tool.trace import ToolBudget, ToolTraceRecorder
 from tool.workspace import Workspace
 
-from .interfaces import EventCallback, KnowledgeRetriever
+from .compactor import EvidenceCompactorSubAgent
+from .interfaces import EventCallback, EvidenceCompactorProtocol, KnowledgeRetriever
 from .model_factory import build_chat_model
 from .prompts import (
     BASELINE_SYSTEM_PROMPT,
@@ -65,6 +66,7 @@ from .schema import (
     AgentVerdict,
     AnalysisTrace,
     DetectionReport,
+    EvidenceSummary,
     KnowledgeRetrieveRecord,
 )
 
@@ -87,6 +89,7 @@ class AgentState(TypedDict):
         "error",
     ]
     knowledge_record: KnowledgeRetrieveRecord | None
+    pending_tool_outputs: list[dict[str, Any]]
     verdict: AgentVerdict | None
     report: DetectionReport | None
 
@@ -165,16 +168,29 @@ class VulnerabilityDetectionAgent:
         *,
         model: BaseChatModel | None = None,
         retriever: KnowledgeRetriever | None = None,
+        compactor: EvidenceCompactorProtocol | None = None,
         default_config: AgentConfig | None = None,
     ) -> None:
         self._model = model
         self.retriever = retriever
+        self._compactor = compactor
         self.default_config = default_config or AgentConfig.improved()
 
     def _get_model(self, config: AgentConfig) -> BaseChatModel:
         if self._model is not None:
             return self._model
         return build_chat_model(config)
+
+    def _get_compactor(self, config: AgentConfig) -> EvidenceCompactorProtocol | None:
+        if not config.enable_evidence_compactor:
+            return None
+        if self._compactor is not None:
+            return self._compactor
+        return EvidenceCompactorSubAgent(
+            model=self._model,
+            config=config,
+            min_chars=config.compactor_min_chars,
+        )
 
     def build_graph(
         self,
@@ -201,7 +217,9 @@ class VulnerabilityDetectionAgent:
         )
         tool_map = {t.name: t for t in tools}
         model_with_tools = model.bind_tools(tools) if tools else model
+        compactor = self._get_compactor(config)
         knowledge_records: list[KnowledgeRetrieveRecord] = []
+        evidence_summaries: list[EvidenceSummary] = []
 
         def emit(
             event_type: Literal[
@@ -210,6 +228,7 @@ class VulnerabilityDetectionAgent:
                 "thought",
                 "tool_call",
                 "tool_result",
+                "evidence_compacted",
                 "self_check",
                 "verdict",
                 "report_ready",
@@ -367,7 +386,8 @@ class VulnerabilityDetectionAgent:
         def execute_tools_node(state: AgentState) -> dict[str, Any]:
             last = state["messages"][-1]
             tool_calls = getattr(last, "tool_calls", None) or []
-            tool_messages: list[ToolMessage] = []
+            audit_focus = _extract_text_content(last.content)[:500]
+            pending: list[dict[str, Any]] = []
             stop_reason = state["stop_reason"]
 
             for tc in tool_calls:
@@ -382,13 +402,64 @@ class VulnerabilityDetectionAgent:
                         content = str(tool_obj.invoke(args))
                     except Exception as exc:  # pragma: no cover - 兜底容错
                         content = f"ERROR: 工具 `{name}` 执行失败：{exc}"
-                tool_messages.append(
-                    ToolMessage(content=content, tool_call_id=call_id, name=name)
+                pending.append(
+                    {
+                        "call_id": call_id,
+                        "name": name,
+                        "args": dict(args),
+                        "raw_output": content,
+                        "audit_focus": audit_focus,
+                    }
                 )
 
             if budget.exhausted:
                 stop_reason = "budget_exhausted"
-            return {"messages": tool_messages, "stop_reason": stop_reason}
+            return {"pending_tool_outputs": pending, "stop_reason": stop_reason}
+
+        # ------------------------------------------------------------------
+        # Node 3.5: 证据摘要压缩子代理节点（隔离短上下文提纯，防稀释主代理）
+        # ------------------------------------------------------------------
+        def compact_evidence_node(state: AgentState) -> dict[str, Any]:
+            pending = state.get("pending_tool_outputs") or []
+            tool_messages: list[ToolMessage] = []
+            fn_name = agent_input.function_name or f"sample_{agent_input.idx}"
+
+            for item in pending:
+                raw_out = str(item["raw_output"])
+                if compactor is not None:
+                    summary = compactor.compact(
+                        function_name=fn_name,
+                        audit_focus=str(item.get("audit_focus") or ""),
+                        tool_name=str(item["name"]),
+                        tool_args=dict(item.get("args") or {}),
+                        raw_output=raw_out,
+                    )
+                    evidence_summaries.append(summary)
+                    emit(
+                        "evidence_compacted",
+                        state["step"],
+                        {
+                            "tool_name": summary.tool_name,
+                            "target": summary.target,
+                            "guard_status": summary.guard_status,
+                            "raw_chars": summary.raw_chars,
+                            "compacted_chars": summary.compacted_chars,
+                            "next_frontier_symbols": summary.next_frontier_symbols,
+                        },
+                    )
+                    msg_content = summary.to_compact_message()
+                else:
+                    msg_content = raw_out
+
+                tool_messages.append(
+                    ToolMessage(
+                        content=msg_content,
+                        tool_call_id=str(item["call_id"]),
+                        name=str(item["name"]),
+                    )
+                )
+
+            return {"messages": tool_messages, "pending_tool_outputs": []}
 
         # ------------------------------------------------------------------
         # Node 4: 防御检查核验与反事实自检节点（Improved 改进措施）
@@ -454,6 +525,7 @@ class VulnerabilityDetectionAgent:
             trace = AnalysisTrace(
                 knowledge_records=list(knowledge_records),
                 repo_records=list(recorder.records),
+                evidence_summaries=list(evidence_summaries),
                 tool_calls_count=len(recorder.records),
                 total_read_chars=sum(r.chars_returned for r in recorder.records),
                 steps_taken=state["step"],
@@ -466,11 +538,13 @@ class VulnerabilityDetectionAgent:
                 metadata={
                     "mode": config.mode,
                     "model_name": config.model_name,
+                    "reasoning_effort": config.reasoning_effort,
                     "repo_name": agent_input.repo_name,
                     "function_name": agent_input.function_name,
                     "enable_rag": config.enable_rag,
                     "enable_repo_tools": use_repo_tools,
                     "evidence_gated_tools": config.evidence_gated_tools,
+                    "enable_evidence_compactor": compactor is not None,
                     "enable_self_check": config.enable_self_check,
                     "elapsed_ms": elapsed_ms,
                 },
@@ -482,6 +556,7 @@ class VulnerabilityDetectionAgent:
         graph.add_node("retrieve_knowledge", retrieve_knowledge_node)
         graph.add_node("analyze_and_plan", analyze_and_plan_node)
         graph.add_node("execute_tools", execute_tools_node)
+        graph.add_node("compact_evidence", compact_evidence_node)
         graph.add_node("self_verify", self_verify_node)
         graph.add_node("finalize_verdict", finalize_verdict_node)
         graph.add_node("build_report", build_report_node)
@@ -497,7 +572,8 @@ class VulnerabilityDetectionAgent:
                 "finalize_verdict": "finalize_verdict",
             },
         )
-        graph.add_edge("execute_tools", "analyze_and_plan")
+        graph.add_edge("execute_tools", "compact_evidence")
+        graph.add_edge("compact_evidence", "analyze_and_plan")
         graph.add_edge("self_verify", "finalize_verdict")
         graph.add_edge("finalize_verdict", "build_report")
         graph.add_edge("build_report", END)
@@ -543,6 +619,7 @@ class VulnerabilityDetectionAgent:
             "step": 0,
             "stop_reason": "sufficient_evidence",
             "knowledge_record": None,
+            "pending_tool_outputs": [],
             "verdict": None,
             "report": None,
         }
