@@ -103,12 +103,13 @@ def run_experiment(
     dataset_zip: Path = Path("data/dataset.zip"),
     knowledge_jsonl: Path = Path("data/knowledge.jsonl"),
     output_dir: Path = Path("experiments/results"),
-    model_name: str = "deepseek-chat",
+    model_name: str = "deepseek-flash",
     num_pairs: int = 12,
     exclude_huge_repos: bool = True,
     max_per_repo: int = 3,
     max_workers: int = 2,
     enable_ablation_rag_only: bool = False,
+    run_names: Sequence[str] | None = None,
 ) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     all_samples = SampleLoader.load_raw_from_zip(dataset_zip, "dataset/test.jsonl")
@@ -159,41 +160,53 @@ def run_experiment(
                     flush=True,
                 )
 
-    runs: list[tuple[str, AgentConfig]] = [
-        ("baseline", AgentConfig.baseline(model_name=model_name)),
-    ]
-    if enable_ablation_rag_only:
-        runs.append(
-            (
-                "improved_rag_check",
-                AgentConfig.improved(
-                    model_name=model_name,
-                    enable_repo_tools=False,
-                    max_tool_calls=0,
-                ),
-            )
-        )
-    runs.append(
-        (
-            "improved",
-            AgentConfig.improved(
-                model_name=model_name,
-                max_steps=5,
-                max_tool_calls=5,
-                max_read_chars=18000,
-                top_k_knowledge=3,
-            ),
-        )
-    )
-
-    summary: dict = {
-        "model_name": model_name,
-        "num_pairs": len(selected) // 2,
-        "num_samples": len(selected),
-        "repos": repos,
-        "selected_indices": [s.idx for s in selected],
-        "runs": {},
+    all_run_configs: dict[str, AgentConfig] = {
+        "baseline": AgentConfig.baseline(model_name=model_name),
+        "improved_rag_check": AgentConfig.improved(
+            model_name=model_name,
+            enable_repo_tools=False,
+            evidence_gated_tools=False,
+            max_tool_calls=0,
+        ),
+        "improved_eager_repo": AgentConfig.improved(
+            model_name=model_name,
+            max_steps=5,
+            max_tool_calls=5,
+            max_read_chars=18000,
+            top_k_knowledge=3,
+            evidence_gated_tools=False,
+        ),
+        "improved_gated": AgentConfig.improved(
+            model_name=model_name,
+            max_steps=5,
+            max_tool_calls=2,
+            max_read_chars=6000,
+            top_k_knowledge=3,
+            evidence_gated_tools=True,
+        ),
     }
+
+    if run_names:
+        runs = [(name, all_run_configs[name]) for name in run_names]
+    else:
+        runs = [("baseline", all_run_configs["baseline"])]
+        if enable_ablation_rag_only:
+            runs.append(("improved_rag_check", all_run_configs["improved_rag_check"]))
+        runs.append(("improved_gated", all_run_configs["improved_gated"]))
+
+    summary_path = output_dir / "summary.json"
+    if summary_path.exists() and run_names:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary.setdefault("runs", {})
+    else:
+        summary = {
+            "model_name": model_name,
+            "num_pairs": len(selected) // 2,
+            "num_samples": len(selected),
+            "repos": repos,
+            "selected_indices": [s.idx for s in selected],
+            "runs": {},
+        }
 
     for run_name, cfg in runs:
         print(f"\n=== Running [{run_name}] (mode={cfg.mode}, rag={cfg.enable_rag}, repo_tools={cfg.enable_repo_tools}, self_check={cfg.enable_self_check}) ===", flush=True)
@@ -261,13 +274,20 @@ def main() -> None:
     parser.add_argument("--dataset-zip", type=Path, default=Path("data/dataset.zip"))
     parser.add_argument("--knowledge", type=Path, default=Path("data/knowledge.jsonl"))
     parser.add_argument("--output-dir", type=Path, default=Path("experiments/results"))
-    parser.add_argument("--model", type=str, default="deepseek-chat")
+    parser.add_argument("--model", type=str, default="deepseek-flash")
     parser.add_argument("--pairs", type=int, default=12)
     parser.add_argument("--include-huge-repos", action="store_true")
     parser.add_argument("--max-per-repo", type=int, default=3)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--ablation-rag-only", action="store_true")
+    parser.add_argument(
+        "--runs",
+        type=str,
+        default="",
+        help="逗号分隔的指定实验组（如 improved_gated），可追加合并到现有 summary.json",
+    )
     args = parser.parse_args()
+    run_names = [x.strip() for x in args.runs.split(",") if x.strip()] or None
 
     run_experiment(
         dataset_zip=args.dataset_zip,
@@ -279,6 +299,7 @@ def main() -> None:
         max_per_repo=args.max_per_repo,
         max_workers=args.workers,
         enable_ablation_rag_only=args.ablation_rag_only,
+        run_names=run_names,
     )
 
 

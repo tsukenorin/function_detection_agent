@@ -55,9 +55,9 @@ IMPROVED_SYSTEM_PROMPT = """你是一位资深的 C/C++ 软件安全漏洞审计
   "guard_assessment": "明确列出关键危险点以及对应检查是否存在、是否覆盖边界条件（如负数、0、上界、溢出、空指针）"
 }"""
 
-SELF_CHECK_PROMPT = """在给出最终裁决前，请执行一次严格的反事实自检（Self-Verification）：
-1. **防误报核验（避免将已修复函数误判为 1）**：你刚才怀疑的漏洞路径，是否已经被函数内某条 `if` / `OP_REQUIRES` / 宏 / 或已查证的被调用函数所拦截？不要因为“理论上可能出错”或无关代码风格问题而判 1。
-2. **防漏报核验（避免将漏洞函数误判为 0）**：请再仔细检查函数内最危险的 1~2 处内存访问、索引计算、长度运算、指针解引用、资源释放或除数，是否存在细微遗漏（例如只查了上界没查下界/负数、`>` 与 `>=` 差一错误、乘法/加法溢出后再比较、空指针或零长度未检查、错误分支未清理/继续使用）？
+SELF_CHECK_PROMPT = """在给出最终裁决前，请执行一次严格的反事实自检（Self-Verification），并始终以**待测函数自身代码行与历史 CVE 修复差异**为主锚点：
+1. **防误报核验（避免将已修复函数误判为 1）**：你刚才怀疑的漏洞路径，是否已经被待测函数内某条 `if` / `OP_REQUIRES` / 宏 / 或已查证的外部被调用函数所拦截？不要因为“理论上可能出错”或无关代码风格问题而判 1。
+2. **防漏报核验（避免将漏洞函数误判为 0）**：请再仔细核对待测函数内最危险的 1~2 处内存访问、索引计算、长度/类型转换、指针解引用、资源释放或除数，是否存在细微遗漏（例如先解引用后判空、只查上界没查负数、`>` 与 `>=` 差一错误、乘法/加法溢出、缺失显式类型转换、返回值未判空）？切勿被仓库中无关上下文冲淡函数本身确凿的缺失守卫。
 3. **仅基于已验证事实裁决**：综合上述核验，直接输出最终的单一合法 JSON 对象（字段：`prediction`, `confidence`, `cwe_candidates`, `reason`, `evidence_cited`, `guard_assessment`），不要再调用工具。"""
 
 JSON_REPAIR_PROMPT = """你刚才的回复未能解析为合法的目标 JSON 格式。
@@ -132,18 +132,26 @@ def build_improved_user_prompt(
     *,
     knowledge_record: KnowledgeRetrieveRecord | None = None,
     has_repo_tools: bool = False,
+    evidence_gated_tools: bool = True,
     max_func_chars: int = 18000,
 ) -> str:
     numbered = format_numbered_func(agent_input.func, max_chars=max_func_chars)
     func_title = agent_input.function_name or "未知函数"
     kb_section = format_knowledge_context(knowledge_record)
 
-    tool_hint = (
-        "当前已挂载该版本的代码仓库只读沙箱工具（`find_symbol`、`grep`、`read_file`、`find_files`、`list_dir`、`stat`）。"
-        "若需确认被调用函数、宏、结构体或调用方是否进行了边界/空指针/溢出校验，请按需调用工具；若函数内部证据已充分，请直接输出最终 JSON 判定。"
-        if has_repo_tools
-        else "当前未挂载仓库工具，请基于函数代码与历史 CVE 知识审慎分析并输出最终 JSON 判定。"
-    )
+    if not has_repo_tools:
+        tool_hint = "当前未挂载仓库工具，请基于函数代码与历史 CVE 知识审慎分析并输出最终 JSON 判定。"
+    elif evidence_gated_tools:
+        tool_hint = (
+            "当前已挂载单版本只读代码仓库工具（`find_symbol`、`grep`、`read_file` 等），执行**严格证据门控策略**：\n"
+            "  - **默认 0 次调用**：先仅看待测函数代码与上方历史 CVE 修复差异。若函数内部已经能直接看到确凿漏洞（如先解引用后判空、返回值未判空、缺失类型转换/边界判断）或完整的局部防御检查，请**不要调用任何仓库工具**，直接输出 JSON 判定！\n"
+            "  - **外科手术式按需调用（最多 1~2 次）**：仅当 0/1 裁决真正取决于某个外部符号（被调用函数内部是否做校验、结构体字段有符号性/数组大小、宏定义）时，才定向调用 `find_symbol` 或短窗口 `read_file`（≤60 行）核实该单一符号，拿到答案立即停止探索。"
+        )
+    else:
+        tool_hint = (
+            "当前已挂载该版本的代码仓库只读沙箱工具（`find_symbol`、`grep`、`read_file`、`find_files`、`list_dir`、`stat`）。"
+            "若需确认被调用函数、宏、结构体或调用方是否进行了边界/空指针/溢出校验，请按需调用工具；若函数内部证据已充分，请直接输出最终 JSON 判定。"
+        )
 
     return (
         f"## 待检测函数信息\n"
