@@ -156,7 +156,7 @@ def run_experiment(
             elif ev.event_type == "evidence_compacted":
                 print(
                     f"  [idx={ev.idx} step={ev.step}] COMPACT {ev.payload.get('tool_name')} "
-                    f"status={ev.payload.get('guard_status')} "
+                    f"completeness={ev.payload.get('evidence_completeness')} "
                     f"{ev.payload.get('raw_chars')}->{ev.payload.get('compacted_chars')} chars "
                     f"next={ev.payload.get('next_frontier_symbols')}",
                     flush=True,

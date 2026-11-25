@@ -441,7 +441,7 @@ class VulnerabilityDetectionAgent:
                         {
                             "tool_name": summary.tool_name,
                             "target": summary.target,
-                            "guard_status": summary.guard_status,
+                            "evidence_completeness": summary.evidence_completeness,
                             "raw_chars": summary.raw_chars,
                             "compacted_chars": summary.compacted_chars,
                             "next_frontier_symbols": summary.next_frontier_symbols,

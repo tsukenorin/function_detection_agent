@@ -1,15 +1,13 @@
-"""证据摘要压缩子代理（EvidenceCompactorSubAgent）。
+"""纯客观证据摘要压缩子代理（EvidenceCompactorSubAgent）。
 
-职责定位（多代理分工）：
-- 主代理（``VulnerabilityDetectionAgent``）负责全局假设规划、决定渐进式调用链展开方向
-  与最终 0/1 裁决，必须保持主上下文高度干净；
-- 本子代理在完全隔离的单轮上下文中运行（固定 ``reasoning_effort="low"``、短输出上限），
-  消费单次仓库/Tree-sitter 工具返回的大段原始输出，提纯出：
-  1. 2~4 条带精确 ``path:line`` 的核心核验事实；
-  2. 明确的守卫状态（``guards_present`` / ``guards_missing`` / ``inconclusive`` / ``irrelevant``）；
-  3. 若仍 ``inconclusive``，列出最多 2 个值得下一跳继续展开的前沿符号（``next_frontier_symbols``）；
-  4. 显式丢弃与核心审计焦点无关的旁支代码或无关风格问题，从源头防止“旁支瑕疵误报（P-V）”
-     与“多跳上下文稀释（P-B）”。
+职责边界（严格中立，不越权代判）：
+- 主代理（``VulnerabilityDetectionAgent``）全权负责漏洞 0/1 裁决与防御充分性判断；
+- 本子代理运行在隔离短上下文中（固定 ``reasoning_effort="low"``），只做**事实抽取与原代码行摘录**：
+  1. 提取 1~4 条带精确 ``path:line`` 的纯客观事实（返回类型、宏值、数组容量、判断条件表达式）；
+  2. 原样摘录最关键的 1~5 行 C/C++ 原代码（``key_code_lines``），避免有损压缩丢失细节；
+  3. 仅标注信息查全状态（``sufficient`` / ``needs_more_hops`` / ``irrelevant``），
+     **严禁输出“安全/已充分防护/存在漏洞”等主观定性结论**；
+  4. 主动过滤与当前审计焦点无关的旁支代码，防止旁支瑕疵污染主代理。
 """
 
 from __future__ import annotations
@@ -27,22 +25,26 @@ from .schema import AgentConfig, EvidenceSummary
 
 __all__ = ["COMPACTOR_SYSTEM_PROMPT", "EvidenceCompactorSubAgent"]
 
-COMPACTOR_SYSTEM_PROMPT = """你是漏洞检测主代理派遣的【证据摘要压缩子代理（Evidence Compactor）】。
-你的唯一任务是阅读单次代码仓库/调用链工具的原始输出，将其提纯为极简、精确、零噪声的结构化证据 JSON，供主代理决策。
+COMPACTOR_SYSTEM_PROMPT = """你是漏洞检测主代理派遣的【纯客观证据摘录子代理（Neutral Evidence Compactor）】。
+你的唯一任务是把单次仓库/调用链工具的冗长原始输出，压缩为带精确行号的**纯客观事实 + 关键原代码行摘录**。
 
-【必须遵守的提纯原则】
-1. **紧扣核心审计焦点**：只保留直接回答主代理疑问的事实（例如被调函数内部是否检查边界/空指针/溢出、结构体字段类型与数组长度、宏常量值、调用方是否已做前置过滤）。
-2. **严禁引入旁支噪声**：如果工具输出里附带了其他不相关函数、历史代码风格问题或与当前核心假设无关的外围空指针，必须**主动过滤丢弃**并在 `filtered_noise_note` 一句话说明，绝不把无关瑕疵写进 `verified_facts`。
-3. **指导渐进式多跳展开**：如果当前证据已足以确认守卫存在（`guards_present`）或缺失（`guards_missing`），`next_frontier_symbols` 必须为空数组 `[]`；仅当状态为 `inconclusive` 且原始输出中存在更深层的决定性调用方/被调用方时，才列出最多 2 个符号名。
-4. **严格引用精确位置**：每条事实尽量以 `path:line` 开头，单条不超过 80 字，总数 1~4 条。
+【绝对不可越界的规则】
+1. **严禁代做安全定性**：绝对不要替主代理下结论说“因此安全”、“防护完整”、“没有漏洞”或“存在漏洞”。你只陈述代码中客观写了什么（例如：`av_parsers.c:4686 返回类型 u32`、`psd.c:716 row_size = columns * packet_size`、`chain.c:43 包含 if (n < 0 || n >= 64) return -1;`）。
+2. **必须保留关键原代码行（`key_code_lines`）**：把与主代理核验焦点直接相关的 1~5 行 C/C++ 代码原样抄录（附带 `path:line:` 前缀），防止摘要丢失 `<` 与 `<=`、类型强转、变量有符号性等关键细节。
+3. **主动过滤旁支噪声**：对于与当前核验焦点无关的其他函数、注释、日志或历史代码风格问题，直接忽略并在 `filtered_noise_note` 一句话说明，绝不写入 `verified_facts`。
+4. **客观标注信息完备度（`evidence_completeness`）**：
+   - `sufficient`：本次输出已包含主代理想查的符号定义/类型/宏值/调用关系；此时 `next_frontier_symbols` 必须为 `[]`。
+   - `needs_more_hops`：仅拿到符号名或转发包装层，还需展开下一跳才能看到实际实现；在 `next_frontier_symbols` 中给出最多 2 个精确符号名。
+   - `irrelevant`：未命中或返回报错/无关内容；`next_frontier_symbols` 为 `[]`。
 
-严格只输出一个合法 JSON 对象（不要加额外说明）：
+严格只输出一个合法 JSON 对象（不要加额外文字）：
 {
   "target": "被查证的符号或文件路径",
-  "verified_facts": ["path:line 具体核验事实1", "..."],
-  "guard_status": "guards_present" | "guards_missing" | "inconclusive" | "irrelevant",
-  "next_frontier_symbols": ["仅在 inconclusive 时填写，最多2个符号名"],
-  "filtered_noise_note": "简述丢弃了哪些无关上下文（无则留空）"
+  "verified_facts": ["path:line 客观事实1（不含安全定性）", "..."],
+  "key_code_lines": ["path:line: 原样 C/C++ 关键代码行", "..."],
+  "evidence_completeness": "sufficient" | "needs_more_hops" | "irrelevant",
+  "next_frontier_symbols": ["仅在 needs_more_hops 时填写，最多2个符号名"],
+  "filtered_noise_note": "简述过滤了哪些无关上下文（无则留空）"
 }"""
 
 
@@ -78,7 +80,11 @@ def _parse_summary_json(
         if raw_text[idx] == "{":
             try:
                 obj, _ = decoder.raw_decode(raw_text[idx:])
-                if isinstance(obj, dict) and ("verified_facts" in obj or "guard_status" in obj):
+                if isinstance(obj, dict) and (
+                    "verified_facts" in obj
+                    or "key_code_lines" in obj
+                    or "evidence_completeness" in obj
+                ):
                     candidates.append(json.dumps(obj, ensure_ascii=False))
                     break
             except json.JSONDecodeError:
@@ -91,10 +97,11 @@ def _parse_summary_json(
             continue
         if not isinstance(data, dict):
             continue
-        if isinstance(data.get("verified_facts"), str):
-            data["verified_facts"] = [data["verified_facts"]]
-        if isinstance(data.get("next_frontier_symbols"), str):
-            data["next_frontier_symbols"] = [data["next_frontier_symbols"]]
+        for list_field in ("verified_facts", "key_code_lines", "next_frontier_symbols"):
+            if isinstance(data.get(list_field), str):
+                data[list_field] = [data[list_field]]
+        # 强制保持中立，防止模型偶发带出主观 guard_status
+        data["guard_status"] = "neutral"
         data.setdefault("target", default_target)
         data["tool_name"] = tool_name
         data["raw_chars"] = raw_chars
@@ -116,7 +123,7 @@ def _target_from_args(tool_args: dict[str, Any]) -> str:
 
 
 class EvidenceCompactorSubAgent:
-    """运行在隔离短上下文中的证据摘要压缩子代理（固定 ``reasoning_effort="low"``）。"""
+    """运行在隔离短上下文中的纯客观证据摘要子代理（固定 ``reasoning_effort="low"``）。"""
 
     def __init__(
         self,
@@ -156,17 +163,18 @@ class EvidenceCompactorSubAgent:
         target = _target_from_args(tool_args)
         raw_len = len(raw_output)
 
-        # 错误信息或本就很短的输出无需额外消耗 LLM 压缩，直接做零开销结构化透传
         if raw_output.startswith("ERROR:") or raw_len < self.min_chars:
-            status = "irrelevant" if raw_output.startswith("ERROR:") else "inconclusive"
-            fact = raw_output.strip()[:400]
+            completeness = "irrelevant" if raw_output.startswith("ERROR:") else "sufficient"
+            snippet = raw_output.strip()[:500]
             summary = EvidenceSummary(
                 tool_name=tool_name,
                 target=target,
-                verified_facts=[fact] if fact else [],
-                guard_status=status,  # type: ignore[arg-type]
+                verified_facts=[snippet] if snippet else [],
+                key_code_lines=[],
+                evidence_completeness=completeness,  # type: ignore[arg-type]
+                guard_status="neutral",
                 next_frontier_symbols=[],
-                filtered_noise_note="短输出/错误直通，未触发子代理 LLM 压缩",
+                filtered_noise_note="短输出/错误直通，未触发子代理压缩",
                 raw_chars=raw_len,
             )
             summary.compacted_chars = len(summary.to_compact_message())
@@ -177,13 +185,13 @@ class EvidenceCompactorSubAgent:
             clipped_raw += f"\n...[原始输出截断，原长 {raw_len} 字符]"
 
         user_prompt = (
-            f"## 主代理当前审计任务\n"
+            f"## 主代理当前查证需求\n"
             f"- 待测目标函数：{function_name or '未知'}\n"
-            f"- 当前核验焦点：{(audit_focus or '核验边界/空指针/溢出守卫是否存在')[:500]}\n"
+            f"- 当前核验焦点：{(audit_focus or '核验目标符号定义、类型、常量或前置条件')[:500]}\n"
             f"- 本次工具调用：`{tool_name}` args={json.dumps(tool_args, ensure_ascii=False)}\n\n"
             f"## 工具原始输出（{raw_len} 字符）\n"
             f"```\n{clipped_raw}\n```\n\n"
-            f"请按规则提纯为单一紧凑 JSON 证据对象。"
+            f"请严格按纯客观摘录规则输出单一 JSON（禁止替主代理做安全定性）。"
         )
 
         try:
@@ -204,14 +212,15 @@ class EvidenceCompactorSubAgent:
         except Exception:
             pass
 
-        # 兜底：若子代理异常或 JSON 解析失败，返回安全的确定性截断摘要，绝不中断主流程
         fallback = EvidenceSummary(
             tool_name=tool_name,
             target=target,
             verified_facts=[clipped_raw[:500].replace("\n", " ")],
-            guard_status="inconclusive",
+            key_code_lines=[],
+            evidence_completeness="needs_more_hops",
+            guard_status="neutral",
             next_frontier_symbols=[],
-            filtered_noise_note="子代理摘要解析回退，仅保留前 500 字符摘录",
+            filtered_noise_note="子代理摘要解析回退，保留前 500 字符摘录",
             raw_chars=raw_len,
         )
         fallback.compacted_chars = len(fallback.to_compact_message())
