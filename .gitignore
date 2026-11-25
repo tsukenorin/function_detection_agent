@@ -8,5 +8,7 @@ __pycache__/
 .idea/
 .cache/
 experiments/results/ckpt_*.jsonl
+experiments/results_*/ckpt_*.jsonl
+
 
 
