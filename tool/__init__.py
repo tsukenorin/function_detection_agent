@@ -33,9 +33,13 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """让 ``build_file_tools`` 按需导入，避免没装 langchain 时整个包不可用。"""
-    if name in {"build_file_tools", "FILE_TOOL_NAMES"}:
+    """让 LangChain 工具与 trace 适配按需导入，避免没装 langchain 时核心层不可用。"""
+    if name in {"build_file_tools", "build_repo_tools", "FILE_TOOL_NAMES", "REPO_TOOL_NAMES"}:
         from . import file_tools
 
         return getattr(file_tools, name)
+    if name in {"ToolBudget", "ToolTraceRecorder", "BudgetExceededError"}:
+        from . import trace
+
+        return getattr(trace, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
